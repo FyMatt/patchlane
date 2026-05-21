@@ -1,0 +1,17 @@
+node_modules
+src
+tsconfig.json
+tsconfig.webview.json
+*.map
+**/*.map
+*.vsix
+.vscode
+.codex
+package-lock.json
+esbuild.webview.mjs
+postcss.config.js
+tailwind.config.js
+src/webview
+dist/test/**
+dist/webview/**
+PLAN.md
