@@ -12,6 +12,26 @@ import {
 } from "./agentFailureStrategy";
 import { GitService } from "./gitService";
 import { PatchService, extractUnifiedDiff, parseUnifiedDiff } from "./patchService";
+import { buildPlanRiskChecks, hasConcreteVerification } from "./patchQualityRules";
+import { inferPatchRiskLevel, normalizePatchRiskLevel, PatchRiskLevel } from "./patchRisk";
+import {
+  advanceStagedTask,
+  buildStagedPhaseRequest,
+  createDraftStageInfo,
+  createPhasePatchPlan,
+  createStagedTaskState,
+  getCurrentStagedPhase,
+  isCurrentStageDraft,
+  markCurrentPhaseApplied,
+  markCurrentPhaseDone,
+  markCurrentPhaseDraftReady,
+  markCurrentPhaseFailed,
+  markCurrentPhaseVerifying,
+  PatchDraftStageInfo,
+  shouldUseStagedExecution,
+  StagedTaskState,
+  startCurrentPhaseGeneration
+} from "./stagedTaskPlan";
 import { collectWorkspaceContext } from "./workspaceContext";
 import { collectPromptFileReferences, readWorkspaceFile, WorkspaceFileReference } from "./workspaceFiles";
 import { ParsedFilePatch } from "./unifiedDiff";
@@ -29,6 +49,7 @@ export interface PatchDraft {
   repairOf?: string;
   repairError?: string;
   verifyRepair?: PatchVerifyRepairInfo;
+  stage?: PatchDraftStageInfo;
 }
 
 export type PatchDraftStatus = "generating" | "reviewing" | "repairing" | "stopped" | "failed";
@@ -45,7 +66,9 @@ export interface PatchVerifyRepairInfo {
 
 export interface PatchPlan {
   summary: string;
+  riskLevel: PatchRiskLevel;
   files: PatchPlanFile[];
+  checkpoints: PatchPlanCheckpoint[];
   steps: string[];
   acceptanceCriteria: string[];
   verification: string[];
@@ -60,6 +83,14 @@ export interface PatchPlanFile {
   operation?: "create" | "modify" | "delete";
 }
 
+export interface PatchPlanCheckpoint {
+  id: string;
+  title: string;
+  files: string[];
+  acceptanceCriteria: string[];
+  verification: string[];
+}
+
 export interface PatchWorkflowState {
   pendingPatch?: PatchDraft;
   activeDraft?: PatchDraft;
@@ -69,6 +100,7 @@ export interface PatchWorkflowState {
   lastBackupId?: string;
   lastApplyError?: string;
   repairCount: number;
+  stagedTask?: StagedTaskState;
 }
 
 export type PatchQualityStatus = "pass" | "warn" | "fail";
@@ -108,7 +140,11 @@ export interface PatchGenerationOptions {
   signal?: AbortSignal;
   onProgress?: (progress: PatchGenerationProgress) => void;
   onDraft?: (draft: PatchDraft, status: PatchDraftStatus, detail?: string) => void;
-  draftMetadata?: Pick<PatchDraft, "verifyRepair">;
+  draftMetadata?: Pick<PatchDraft, "verifyRepair" | "stage">;
+  staged?: "auto" | "off";
+  planOverride?: PatchPlan;
+  patchRequestOverride?: string;
+  retryReason?: string;
 }
 
 export interface PatchApplyWorkflowOptions {
@@ -123,6 +159,7 @@ export class PatchWorkflowService {
   private activeDraftDetail?: string;
   private lastAppliedPatch?: PatchDraft;
   private lastApplyError?: string;
+  private stagedTask?: StagedTaskState;
   private repairCount = 0;
 
   public constructor(
@@ -140,7 +177,8 @@ export class PatchWorkflowService {
       lastAppliedPatch: this.lastAppliedPatch,
       lastBackupId: this.patchService.getLastBackupId(),
       lastApplyError: this.lastApplyError,
-      repairCount: this.repairCount
+      repairCount: this.repairCount,
+      stagedTask: this.stagedTask
     };
   }
 
@@ -156,6 +194,7 @@ export class PatchWorkflowService {
     };
     let streamedContent = "";
     let lastDraftUpdate = 0;
+    let stageInfo = options.draftMetadata?.stage;
     const publishDraft = (status: PatchDraftStatus, detail?: string, force = false): void => {
       const now = Date.now();
       if (!force && now - lastDraftUpdate < 140) {
@@ -168,6 +207,7 @@ export class PatchWorkflowService {
         ...streamDraftBase,
         ...options.draftMetadata,
         plan: streamDraftBase.plan,
+        stage: stageInfo,
         patchText,
         fileCount: files.length,
         files: files.map((filePatch) => resolvePatchLabel(filePatch))
@@ -181,12 +221,26 @@ export class PatchWorkflowService {
     options.onProgress?.({ stage: "references", label: "整理引用文件", detail: "解析 @文件 和当前编辑器上下文" });
     const fileReferences = await collectPromptFileReferences(request);
     options.onProgress?.({ stage: "plan", label: "制定执行计划", detail: "识别目标文件、步骤和验证方式" });
-    const plan = await this.createPatchPlan(request, context, fileReferences, activeModel, options);
+    const basePlan = options.planOverride ?? await this.createPatchPlan(request, context, fileReferences, activeModel, options);
+    let plan = basePlan;
+    let patchRequest = options.patchRequestOverride ?? request;
+    if (!options.planOverride && options.staged !== "off" && shouldUseStagedExecution(basePlan, request)) {
+      this.stagedTask = startCurrentPhaseGeneration(createStagedTaskState(basePlan, request));
+      const phase = getCurrentStagedPhase(this.stagedTask);
+      if (phase) {
+        plan = createPhasePatchPlan(basePlan, phase, this.stagedTask.currentPhaseIndex, this.stagedTask.phaseCount);
+        patchRequest = buildStagedPhaseRequest(request, this.stagedTask, phase, options.retryReason);
+        stageInfo = createDraftStageInfo(this.stagedTask, phase);
+        options.onProgress?.({ stage: "plan", label: "拆分阶段任务", detail: `${stageInfo.phaseIndex}/${stageInfo.phaseCount} · ${phase.title}` });
+      }
+    } else if (!options.planOverride && !stageInfo) {
+      this.stagedTask = undefined;
+    }
     streamDraftBase.plan = plan;
     options.onProgress?.({ stage: "plan", label: "制定执行计划", detail: summarizePlan(plan) });
     const scopedReferences = await collectPlannedFileReferences(plan, context, fileReferences, budget.patchFileChars, budget.readFiles + 2);
     options.onProgress?.({ stage: "model", label: "请求模型生成修改", detail: `${activeModel.providerId} / ${activeModel.modelId}` });
-    publishDraft("generating", "正在等待模型开始输出。", true);
+    publishDraft("generating", stageInfo ? `正在生成阶段 ${stageInfo.phaseIndex}/${stageInfo.phaseCount}：${stageInfo.phaseTitle}` : "正在等待模型开始输出。", true);
     let response: ChatResponse;
     try {
       response = await this.providers.get(activeModel.providerId).chat({
@@ -209,7 +263,7 @@ export class PatchWorkflowService {
           },
           {
             role: "user",
-            content: buildPatchPrompt(request, context, scopedReferences, plan, budget)
+            content: buildPatchPrompt(patchRequest, context, scopedReferences, plan, budget, stageInfo)
           }
         ],
         temperature: getModelTemperature(),
@@ -225,6 +279,9 @@ export class PatchWorkflowService {
       streamedContent = response.content;
     } catch (error) {
       const message = formatProviderErrorForUser(error);
+      if (stageInfo && isCurrentStageDraft(this.stagedTask, stageInfo)) {
+        this.stagedTask = markCurrentPhaseFailed(this.stagedTask!, message);
+      }
       if (isAbortError(error)) {
         publishDraft("stopped", "已停止生成。未完成的草稿不会自动写入工作区。", true);
       } else if (streamedContent.trim()) {
@@ -234,6 +291,7 @@ export class PatchWorkflowService {
           ...streamDraftBase,
           ...options.draftMetadata,
           plan: streamDraftBase.plan,
+          stage: stageInfo,
           patchText: "",
           fileCount: 0,
           files: [],
@@ -252,6 +310,7 @@ export class PatchWorkflowService {
       const failedDraft: PatchDraft = {
         ...streamDraftBase,
         ...options.draftMetadata,
+        stage: stageInfo,
         plan,
         patchText,
         fileCount: files.length,
@@ -259,6 +318,9 @@ export class PatchWorkflowService {
         quality: createTruncatedGenerationQuality(response.finishReason)
       };
       this.setActiveDraft(failedDraft, "failed", message);
+      if (stageInfo && isCurrentStageDraft(this.stagedTask, stageInfo)) {
+        this.stagedTask = markCurrentPhaseFailed(this.stagedTask!, message);
+      }
       options.onDraft?.(failedDraft, "failed", message);
       throw new Error(message);
     }
@@ -270,18 +332,18 @@ export class PatchWorkflowService {
     let files = parsed.files.map((filePatch) => resolvePatchLabel(filePatch));
     options.onProgress?.({ stage: "review", label: "审查修改质量", detail: "检查计划覆盖、文件范围和潜在风险" });
     publishDraft("reviewing", "正在审查修改质量。", true);
-    let quality = await this.reviewPatchQuality(request, patchText, plan, scopedReferences, activeModel, options);
+    let quality = await this.reviewPatchQuality(patchRequest, patchText, plan, scopedReferences, activeModel, options);
     const maxRepairAttempts = getAgentMaxRepairAttempts();
     for (let attempt = 1; quality.status === "fail" && attempt <= maxRepairAttempts; attempt += 1) {
       options.onProgress?.({ stage: "repair", label: "修复修改草稿", detail: `第 ${attempt}/${maxRepairAttempts} 轮：${quality.summary}` });
       publishDraft("repairing", quality.summary, true);
       try {
-        patchText = await this.repairGeneratedPatch(request, patchText, quality, plan, context, scopedReferences, activeModel, options);
+        patchText = await this.repairGeneratedPatch(patchRequest, patchText, quality, plan, context, scopedReferences, activeModel, options);
         parsed = parseUnifiedDiff(patchText);
         files = parsed.files.map((filePatch) => resolvePatchLabel(filePatch));
         options.onProgress?.({ stage: "review", label: "复查修改质量", detail: `第 ${attempt}/${maxRepairAttempts} 轮修复后复查` });
         quality = {
-          ...(await this.reviewPatchQuality(request, patchText, plan, scopedReferences, activeModel, options)),
+          ...(await this.reviewPatchQuality(patchRequest, patchText, plan, scopedReferences, activeModel, options)),
           repaired: true
         };
       } catch (error) {
@@ -303,14 +365,87 @@ export class PatchWorkflowService {
       files,
       plan,
       quality,
-      ...options.draftMetadata
+      ...options.draftMetadata,
+      stage: stageInfo
     };
 
+    if (stageInfo && isCurrentStageDraft(this.stagedTask, stageInfo)) {
+      this.stagedTask = markCurrentPhaseDraftReady(this.stagedTask!, draft.id, draft.files);
+      draft.stage = createDraftStageInfo(this.stagedTask!, getCurrentStagedPhase(this.stagedTask!)!);
+    }
     this.setPendingPatch(draft);
     this.clearActiveDraft();
     options.onProgress?.({ stage: "ready", label: "修改草稿已生成", detail: `${draft.fileCount} 个文件` });
     showPatchReadyMessage(draft);
     return draft;
+  }
+
+  public canContinueStagedTask(): boolean {
+    const phase = getCurrentStagedPhase(this.stagedTask);
+    return Boolean(phase && this.stagedTask?.status !== "done" && (phase.status === "applied" || phase.status === "done"));
+  }
+
+  public isStagedTaskComplete(): boolean {
+    return this.stagedTask?.status === "done";
+  }
+
+  public getCurrentStagedPhaseTitle(): string | undefined {
+    return getCurrentStagedPhase(this.stagedTask)?.title;
+  }
+
+  public markAppliedDraftForStagedTask(draft: PatchDraft): void {
+    if (draft.stage && isCurrentStageDraft(this.stagedTask, draft.stage)) {
+      this.stagedTask = markCurrentPhaseApplied(this.stagedTask!);
+    }
+  }
+
+  public markCurrentStageVerifying(): void {
+    if (getCurrentStagedPhase(this.stagedTask)) {
+      this.stagedTask = markCurrentPhaseVerifying(this.stagedTask!);
+    }
+  }
+
+  public markCurrentStageFailed(reason: string): void {
+    if (getCurrentStagedPhase(this.stagedTask)) {
+      this.stagedTask = markCurrentPhaseFailed(this.stagedTask!, reason);
+    }
+  }
+
+  public markCurrentStageDone(): void {
+    if (getCurrentStagedPhase(this.stagedTask)) {
+      this.stagedTask = markCurrentPhaseDone(this.stagedTask!);
+    }
+  }
+
+  public async generateNextStagedPatch(options: PatchGenerationOptions = {}): Promise<PatchDraft | undefined> {
+    if (!this.stagedTask) {
+      return undefined;
+    }
+    let state = this.stagedTask;
+    const phase = getCurrentStagedPhase(state);
+    if (!phase) {
+      return undefined;
+    }
+    if (phase.status === "failed") {
+      throw new Error("当前阶段失败，需要先续跑当前阶段，不能跳过失败阶段。");
+    }
+    if (phase.status !== "done") {
+      state = markCurrentPhaseDone(state);
+    }
+    state = advanceStagedTask(state);
+    this.stagedTask = state;
+    if (state.status === "done") {
+      return undefined;
+    }
+    return this.generateCurrentStagedPatch(options);
+  }
+
+  public async retryCurrentStagedPatch(reason: string, options: PatchGenerationOptions = {}): Promise<PatchDraft> {
+    if (!this.stagedTask) {
+      throw new Error("暂无可续跑的阶段任务。");
+    }
+    this.stagedTask = markCurrentPhaseFailed(this.stagedTask, reason);
+    return this.generateCurrentStagedPatch({ ...options, retryReason: reason });
   }
 
   public async applyPendingPatch(options: PatchApplyWorkflowOptions = {}): Promise<PatchApplyWorkflowResult> {
@@ -335,13 +470,16 @@ export class PatchWorkflowService {
     try {
       const result = await this.patchService.applyUnifiedDiff(draft.patchText, { signal: options.signal });
       this.pendingPatch = undefined;
-      this.lastAppliedPatch = draft;
       this.lastApplyError = undefined;
+      this.markAppliedDraftForStagedTask(draft);
+      this.lastAppliedPatch = draft.stage && isCurrentStageDraft(this.stagedTask, draft.stage)
+        ? { ...draft, stage: createDraftStageInfo(this.stagedTask!, getCurrentStagedPhase(this.stagedTask!)!) }
+        : draft;
       vscode.window.showInformationMessage(`已应用 ${result.files.length} 个文件的修改。`);
       return {
         status: "applied",
         appliedFiles: result.files.length,
-        appliedDraft: draft
+        appliedDraft: this.lastAppliedPatch
       };
     } catch (error) {
       if (isAbortError(error)) {
@@ -349,6 +487,9 @@ export class PatchWorkflowService {
       }
       const message = error instanceof Error ? error.message : String(error);
       this.lastApplyError = message;
+      if (draft.stage && isCurrentStageDraft(this.stagedTask, draft.stage)) {
+        this.stagedTask = markCurrentPhaseFailed(this.stagedTask!, message);
+      }
       const repairedDraft = await this.repairPendingPatch(message, draft);
       vscode.window.showWarningMessage("修改没有成功应用，已生成修复后的草稿，请重新确认。");
       return {
@@ -368,6 +509,7 @@ export class PatchWorkflowService {
     this.pendingPatch = undefined;
     this.clearActiveDraft();
     this.lastApplyError = undefined;
+    this.stagedTask = undefined;
   }
 
   public async replacePendingPatch(patchText: string, request: string): Promise<PatchDraft> {
@@ -380,9 +522,17 @@ export class PatchWorkflowService {
       createdAt: new Date().toISOString(),
       patchText,
       fileCount: files.length,
-      files
+      files,
+      plan: this.pendingPatch?.plan,
+      quality: this.pendingPatch?.quality,
+      verifyRepair: this.pendingPatch?.verifyRepair,
+      stage: this.pendingPatch?.stage
     };
 
+    if (draft.stage && isCurrentStageDraft(this.stagedTask, draft.stage)) {
+      this.stagedTask = markCurrentPhaseDraftReady(this.stagedTask!, draft.id, draft.files);
+      draft.stage = createDraftStageInfo(this.stagedTask!, getCurrentStagedPhase(this.stagedTask!)!);
+    }
     this.setPendingPatch(draft);
     showPatchReadyMessage(draft);
     return draft;
@@ -436,13 +586,42 @@ export class PatchWorkflowService {
       plan: failedDraft.plan,
       repairOf: failedDraft.id,
       repairError: errorMessage,
-      verifyRepair: failedDraft.verifyRepair
+      verifyRepair: failedDraft.verifyRepair,
+      stage: failedDraft.stage
     };
 
     this.repairCount += 1;
+    if (repairedDraft.stage && isCurrentStageDraft(this.stagedTask, repairedDraft.stage)) {
+      this.stagedTask = markCurrentPhaseDraftReady(this.stagedTask!, repairedDraft.id, repairedDraft.files);
+      repairedDraft.stage = createDraftStageInfo(this.stagedTask!, getCurrentStagedPhase(this.stagedTask!)!);
+    }
     this.setPendingPatch(repairedDraft);
     showPatchReadyMessage(repairedDraft);
     return repairedDraft;
+  }
+
+  private async generateCurrentStagedPatch(options: PatchGenerationOptions = {}): Promise<PatchDraft> {
+    if (!this.stagedTask) {
+      throw new Error("暂无可续跑的阶段任务。");
+    }
+    this.stagedTask = startCurrentPhaseGeneration(this.stagedTask);
+    const phase = getCurrentStagedPhase(this.stagedTask);
+    if (!phase) {
+      throw new Error("阶段任务没有可执行阶段。");
+    }
+    const phasePlan = createPhasePatchPlan(this.stagedTask.plan, phase, this.stagedTask.currentPhaseIndex, this.stagedTask.phaseCount);
+    const stageInfo = createDraftStageInfo(this.stagedTask, phase);
+    const phaseRequest = buildStagedPhaseRequest(this.stagedTask.request, this.stagedTask, phase, options.retryReason);
+    return this.generatePatch(this.stagedTask.request, {
+      ...options,
+      staged: "off",
+      planOverride: phasePlan,
+      patchRequestOverride: phaseRequest,
+      draftMetadata: {
+        ...options.draftMetadata,
+        stage: stageInfo
+      }
+    });
   }
 
   private async reviewPatchQuality(
@@ -616,7 +795,8 @@ function buildPatchPrompt(
   context: Awaited<ReturnType<typeof collectWorkspaceContext>>,
   fileReferences: WorkspaceFileReference[] = [],
   plan?: PatchPlan,
-  budget: AgentContextBudget = getAgentContextBudget()
+  budget: AgentContextBudget = getAgentContextBudget(),
+  stage?: PatchDraftStageInfo
 ): string {
   const activeFileBlock = context.activeFilePath
     ? [
@@ -656,6 +836,14 @@ function buildPatchPrompt(
     "",
     "Approved implementation plan:",
     plan ? formatPlanForPrompt(plan) : "No explicit plan was available. Infer the smallest safe plan from context.",
+    stage ? [
+      "",
+      "Staged execution:",
+      `- Current phase: ${stage.phaseIndex}/${stage.phaseCount}`,
+      `- Phase title: ${stage.phaseTitle}`,
+      `- Phase attempt: ${stage.attempt}`,
+      "- Generate only this phase's diff. Do not implement later phases early."
+    ].join("\n") : "",
     "",
     activeFileBlock,
     "",
@@ -741,8 +929,12 @@ function buildPlanPrompt(
     "Return this JSON shape exactly:",
     "{",
     '  "summary": "一句中文说明本次实现目标",',
+    '  "riskLevel": "low | medium | high",',
     '  "files": [',
     '    { "path": "repo-relative/path.ts", "operation": "modify", "reason": "中文说明为什么需要修改这个文件" }',
+    "  ],",
+    '  "checkpoints": [',
+    '    { "id": "cp1", "title": "阶段目标", "files": ["repo-relative/path.ts"], "acceptanceCriteria": ["阶段验收标准"], "verification": ["阶段验证方式"] }',
     "  ],",
     '  "steps": ["简短中文实现步骤"],',
     '  "acceptanceCriteria": ["用户能看到或验证的完成标准"],',
@@ -755,8 +947,10 @@ function buildPlanPrompt(
     "Rules:",
     "- Prefer the active file and referenced files when they are relevant.",
     "- Include at most 6 files and at most 6 steps.",
+    "- Include 1-4 checkpoints for complex tasks; each checkpoint should name the target files, local acceptance criteria, and verification. Use one checkpoint for simple tasks.",
     "- Include 1-5 acceptanceCriteria that can be checked after the patch.",
     "- operation must be create, modify, or delete.",
+    "- riskLevel should be high for delete/migration/auth/security/data/API-contract or broad changes, medium for multi-file/config/build changes, otherwise low.",
     "- Do not include dependency/build output/generated files unless explicitly requested.",
     "- If the request is ambiguous, state the assumption instead of inventing unseen APIs.",
     "- summary, reason, steps, verification, and assumptions must use Simplified Chinese."
@@ -937,8 +1131,9 @@ function parsePlanJson(content: string): unknown {
   }
 }
 
-function buildStaticQualityChecks(patchText: string, plan: PatchPlan): PatchQualityCheck[] {
+export function buildStaticQualityChecks(patchText: string, plan: PatchPlan): PatchQualityCheck[] {
   const checks: PatchQualityCheck[] = [];
+  checks.push(...buildPlanRiskChecks(plan));
   let parsed: ReturnType<typeof parseUnifiedDiff> | undefined;
   try {
     parsed = parseUnifiedDiff(patchText);
@@ -974,6 +1169,17 @@ function buildStaticQualityChecks(patchText: string, plan: PatchPlan): PatchQual
     label: "文件范围",
     status: outsidePlan.length === 0 ? "pass" : outsidePlan.length <= 1 ? "warn" : "fail",
     detail: outsidePlan.length === 0 ? "修改文件都在计划范围内。" : `存在计划外文件：${outsidePlan.join("、")}`
+  });
+
+  const checkpointFiles = new Set((plan.checkpoints ?? []).flatMap((checkpoint) => checkpoint.files));
+  const outsideCheckpoint = changedPaths.filter((path) => checkpointFiles.size > 0 && !checkpointFiles.has(path));
+  checks.push({
+    id: "checkpoint-scope",
+    label: "阶段范围",
+    status: outsideCheckpoint.length === 0 ? "pass" : outsideCheckpoint.length === 1 ? "warn" : "fail",
+    detail: outsideCheckpoint.length === 0
+      ? "修改文件符合当前阶段范围。"
+      : `当前阶段不应提前修改这些文件：${outsideCheckpoint.join("、")}`
   });
 
   const generatedFiles = changedPaths.filter((path) => isGeneratedOrDependencyPath(path));
@@ -1198,20 +1404,31 @@ function normalizePatchPlan(
         .filter((item): item is PatchPlanFile => Boolean(item))
         .slice(0, 6)
     : [];
+  const risks = normalizeTextArray(object.risks, 5);
 
   const plan: PatchPlan = {
     summary: normalizeText(object.summary) || `根据需求生成可审阅的最小修改：${request.slice(0, 80)}`,
+    riskLevel: normalizePatchRiskLevel(object.riskLevel) ?? inferPatchRiskLevel(files, risks),
     files,
+    checkpoints: Array.isArray(object.checkpoints)
+      ? object.checkpoints
+          .map((item, index) => normalizePlanCheckpoint(item, index + 1, files))
+          .filter((item): item is PatchPlanCheckpoint => Boolean(item))
+          .slice(0, 4)
+      : [],
     steps: normalizeTextArray(object.steps, 6),
     acceptanceCriteria: normalizeTextArray(object.acceptanceCriteria, 5),
     verification: normalizeTextArray(object.verification, 5),
-    risks: normalizeTextArray(object.risks, 5),
+    risks,
     contextGaps: normalizeTextArray(object.contextGaps, 5),
     assumptions: normalizeTextArray(object.assumptions, 5)
   };
 
   if (plan.files.length === 0) {
     plan.files = createFallbackPlan(request, context, fileReferences).files;
+  }
+  if (!normalizePatchRiskLevel(object.riskLevel)) {
+    plan.riskLevel = inferPatchRiskLevel(plan.files, plan.risks);
   }
   if (plan.steps.length === 0) {
     plan.steps = ["阅读上下文并定位最小修改点", "生成可审阅的 unified diff"];
@@ -1222,8 +1439,70 @@ function normalizePatchPlan(
   if (plan.acceptanceCriteria.length === 0) {
     plan.acceptanceCriteria = ["修改内容与用户需求一致", "修改范围保持在计划文件内", "生成的 diff 可以被人工审查后应用"];
   }
+  if (plan.checkpoints.length === 0) {
+    plan.checkpoints = createFallbackCheckpoints(plan);
+  }
+  strengthenHighRiskPlan(plan);
 
   return plan;
+}
+
+function normalizePlanCheckpoint(value: unknown, index: number, planFiles: PatchPlanFile[]): PatchPlanCheckpoint | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const item = value as Partial<PatchPlanCheckpoint>;
+  const title = normalizeText(item.title);
+  if (!title) {
+    return undefined;
+  }
+
+  const knownFiles = new Set(planFiles.map((file) => file.path));
+  const files = normalizeTextArray(item.files, 6)
+    .filter((path) => knownFiles.size === 0 || knownFiles.has(path))
+    .slice(0, 4);
+
+  return {
+    id: normalizeText(item.id) || `cp${index}`,
+    title,
+    files,
+    acceptanceCriteria: normalizeTextArray(item.acceptanceCriteria, 4),
+    verification: normalizeTextArray(item.verification, 4)
+  };
+}
+
+function createFallbackCheckpoints(plan: PatchPlan): PatchPlanCheckpoint[] {
+  return [{
+    id: "cp1",
+    title: "完成最小可审查修改",
+    files: plan.files.map((file) => file.path).slice(0, 4),
+    acceptanceCriteria: plan.acceptanceCriteria.slice(0, 3),
+    verification: plan.verification.slice(0, 3)
+  }];
+}
+
+function strengthenHighRiskPlan(plan: PatchPlan): void {
+  if (plan.riskLevel !== "high") {
+    return;
+  }
+
+  if (!hasConcreteVerification(plan)) {
+    plan.verification = [
+      ...plan.verification.filter((item) => item !== "检查修改结果页面中的 diff，确认后再应用"),
+      "人工验证高风险影响面，并运行项目相关测试、类型检查或构建命令"
+    ].slice(0, 5);
+  }
+
+  if (plan.checkpoints.length === 0) {
+    plan.checkpoints = createFallbackCheckpoints(plan);
+  }
+  if (plan.checkpoints.every((checkpoint) => checkpoint.verification.length === 0)) {
+    plan.checkpoints[0] = {
+      ...plan.checkpoints[0],
+      verification: plan.verification.slice(0, 3)
+    };
+  }
 }
 
 function normalizePlanFile(value: unknown): PatchPlanFile | undefined {
@@ -1281,7 +1560,15 @@ function createFallbackPlan(
 
   return {
     summary: `根据当前上下文完成最小可审阅修改：${request.slice(0, 80)}`,
+    riskLevel: inferPatchRiskLevel(files, []),
     files,
+    checkpoints: [{
+      id: "cp1",
+      title: "完成最小可审查修改",
+      files: files.map((file) => file.path).slice(0, 4),
+      acceptanceCriteria: ["修改内容直接回应用户需求", "修改范围保持最小且可审阅"],
+      verification: ["在修改结果页检查 diff，确认无误后应用"]
+    }],
     steps: [
       "读取当前文件和引用文件",
       "定位与需求直接相关的修改点",
@@ -1380,12 +1667,23 @@ function compactText(value: string, maxChars: number): string {
 }
 
 function formatPlanForPrompt(plan: PatchPlan): string {
+  const checkpoints = plan.checkpoints ?? [];
   return [
     `计划摘要：${plan.summary}`,
+    `风险等级：${formatPatchRiskLevel(plan.riskLevel ?? "low")}`,
     "涉及文件：",
     ...(plan.files.length > 0
       ? plan.files.map((file) => `- ${file.operation ?? "modify"} ${file.path}: ${file.reason}`)
       : ["- 未指定"]),
+    "检查点：",
+    ...(checkpoints.length > 0
+      ? checkpoints.flatMap((checkpoint, index) => [
+          `${index + 1}. ${checkpoint.title}`,
+          checkpoint.files.length > 0 ? `   文件：${checkpoint.files.join("、")}` : "   文件：按计划文件推断",
+          checkpoint.acceptanceCriteria.length > 0 ? `   验收：${checkpoint.acceptanceCriteria.join("；")}` : "",
+          checkpoint.verification.length > 0 ? `   验证：${checkpoint.verification.join("；")}` : ""
+        ].filter(Boolean))
+      : ["- 按执行步骤完成最小修改"]),
     "执行步骤：",
     ...(plan.steps.length > 0 ? plan.steps.map((step) => `- ${step}`) : ["- 推断最小安全修改"]),
     "验收标准：",
@@ -1397,6 +1695,16 @@ function formatPlanForPrompt(plan: PatchPlan): string {
     "上下文缺口：",
     ...(plan.contextGaps.length > 0 ? plan.contextGaps.map((gap) => `- ${gap}`) : ["- 无"])
   ].join("\n");
+}
+
+function formatPatchRiskLevel(level: PatchRiskLevel): string {
+  if (level === "high") {
+    return "high（高风险，需要更严格审查和验证）";
+  }
+  if (level === "medium") {
+    return "medium（中风险，需要按影响范围验证）";
+  }
+  return "low（低风险，保持最小修改即可）";
 }
 
 function summarizePlan(plan: PatchPlan): string {

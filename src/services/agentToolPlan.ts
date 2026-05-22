@@ -1,6 +1,7 @@
 import { AgentCapabilityConfig } from "../config";
 
 export type AgentToolAction =
+  | { type: "search_text"; query: string; reason?: string }
   | { type: "read_file"; path: string; reason?: string }
   | { type: "web_search"; query: string; reason?: string }
   | { type: "run_capability"; capabilityId: string; input?: string; reason?: string }
@@ -69,6 +70,9 @@ export function getToolActionKey(action: AgentToolAction): string {
   if (action.type === "read_file") {
     return `read_file:${normalizePath(action.path)}`;
   }
+  if (action.type === "search_text") {
+    return `search_text:${action.query.trim().toLowerCase()}`;
+  }
   if (action.type === "web_search") {
     return `web_search:${action.query.trim().toLowerCase()}`;
   }
@@ -93,6 +97,9 @@ function normalizeAction(item: Record<string, unknown>, capabilities: Set<string
   const reason = typeof item.reason === "string" ? item.reason : undefined;
   if (type === "read_file" && typeof item.path === "string" && item.path.trim()) {
     return { type, path: normalizePath(item.path), reason };
+  }
+  if (type === "search_text" && typeof item.query === "string" && item.query.trim()) {
+    return { type, query: item.query.trim(), reason };
   }
   if (type === "web_search" && typeof item.query === "string" && item.query.trim()) {
     return { type, query: item.query.trim(), reason };

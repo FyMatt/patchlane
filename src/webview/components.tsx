@@ -32,6 +32,7 @@ import {
   Square,
   Trash2,
   Wand2,
+  Workflow,
   X,
   Zap
 } from "lucide-react";
@@ -58,6 +59,8 @@ interface ActionItem {
   requiresFile?: boolean;
   requiresPatch?: boolean;
   requiresBackup?: boolean;
+  requiresStagedTask?: boolean;
+  requiresFailedStage?: boolean;
 }
 
 interface PatchFilePreview {
@@ -111,6 +114,8 @@ const patchActions: ActionItem[] = [
   { id: "apply", label: "应用修改", description: "把确认后的修改写入项目文件", command: "applyPatch", icon: Check, requiresPatch: true },
   { id: "verify", label: "运行验证", description: "运行配置好的验证命令并记录结果", command: "runSessionVerify", icon: Play },
   { id: "verify-fix", label: "验证并修复", description: "验证失败时自动生成新的修复草稿", command: "verifyAndFix", icon: ShieldCheck },
+  { id: "continue-stage", label: "继续阶段", description: "生成下一个阶段的独立 diff", command: "continueStagedTask", icon: Workflow, requiresStagedTask: true },
+  { id: "retry-stage", label: "续跑阶段", description: "重新生成当前失败阶段的 diff", command: "retryStagedPhase", icon: RefreshCw, requiresFailedStage: true },
   { id: "hunks", label: "部分应用", description: "选择要应用的部分修改", command: "applySelectedPatchHunks", icon: Layers, requiresPatch: true },
   { id: "discard", label: "放弃草稿", description: "放弃当前待确认修改", command: "discardPatch", icon: Trash2, requiresPatch: true },
   { id: "rollback", label: "撤回上次", description: "恢复上一次应用修改前的状态", command: "rollbackPatch", icon: RotateCcw, requiresBackup: true }
@@ -129,7 +134,10 @@ const skillOptions: ChoiceItem[] = [
   { id: "tests", label: "测试生成", description: "补充单元测试、集成测试或验证步骤", icon: ShieldCheck, kind: "builtin" },
   { id: "docs", label: "文档生成", description: "生成注释、README 或使用说明", icon: MessageSquare, kind: "builtin" },
   { id: "perf", label: "性能优化", description: "分析热点路径和资源消耗", icon: Wand2, kind: "builtin" },
-  { id: "security", label: "安全检查", description: "检查输入校验、权限和敏感信息风险", icon: KeyRound, kind: "builtin" }
+  { id: "security", label: "安全检查", description: "检查输入校验、权限和敏感信息风险", icon: KeyRound, kind: "builtin" },
+  { id: "engineering-plan", label: "工程化计划", description: "拆分阶段、边界、验收和验证策略", icon: Workflow, kind: "builtin" },
+  { id: "refactor", label: "重构迁移", description: "按兼容层、调用点、测试和清理顺序推进", icon: Wand2, kind: "builtin" },
+  { id: "quality-gate", label: "质量门禁", description: "强化风险、回滚、测试覆盖和发布前检查", icon: ShieldCheck, kind: "builtin" }
 ];
 
 const toolOptions: ChoiceItem[] = [
@@ -141,6 +149,10 @@ const toolOptions: ChoiceItem[] = [
   { id: "github-search", label: "GitHub", description: "优先搜索仓库、Issue、Release 和 Discussion", icon: FolderSearch, kind: "builtin" },
   { id: "news-search", label: "最新消息", description: "优先搜索 Release、Changelog 和近期公告", icon: RefreshCw, kind: "builtin" },
   { id: "tests", label: "测试运行器", description: "执行配置好的验证命令", icon: ShieldCheck, kind: "builtin" },
+  { id: "task-plan", label: "任务编排", description: "维护阶段、多 diff 和失败续跑状态", icon: Workflow, kind: "builtin" },
+  { id: "repo-map", label: "仓库地图", description: "提供低 token 的项目结构和关键文件摘要", icon: FolderSearch, kind: "builtin" },
+  { id: "quality-gate", label: "质量门禁", description: "检查计划、diff 范围、风险和验证", icon: ShieldCheck, kind: "builtin" },
+  { id: "failure-memory", label: "失败记忆", description: "召回历史验证失败和修复策略", icon: RefreshCw, kind: "builtin" },
   { id: "mcp", label: "MCP 工具", description: "连接 MCP 协议的外部工具", icon: Layers, kind: "mcp" },
   { id: "custom", label: "自定义工具", description: "预留团队内部工具或业务系统入口", icon: Settings2, kind: "custom" }
 ];
@@ -185,11 +197,17 @@ function iconForCapability(item: Pick<AgentCapability, "id" | "kind">, group: "s
         return MessageSquare;
       case "perf":
         return Wand2;
-      case "security":
-        return KeyRound;
-      default:
-        return Wand2;
-    }
+    case "security":
+      return KeyRound;
+    case "engineering-plan":
+      return Workflow;
+    case "refactor":
+      return Wand2;
+    case "quality-gate":
+      return ShieldCheck;
+    default:
+      return Wand2;
+  }
   }
 
   switch (item.id) {
@@ -208,6 +226,15 @@ function iconForCapability(item: Pick<AgentCapability, "id" | "kind">, group: "s
       return RefreshCw;
     case "tests":
       return ShieldCheck;
+    case "task-plan":
+    case "staged-task":
+      return Workflow;
+    case "repo-map":
+      return FolderSearch;
+    case "quality-gate":
+      return ShieldCheck;
+    case "failure-memory":
+      return RefreshCw;
     case "mcp":
       return Layers;
     case "custom":
@@ -797,12 +824,17 @@ function WebSearchCard({ item, index }: { item: TranscriptItem; index: number })
 
 function WebSourceItem({ source, index }: { source: WebSearchSource; index: number }): JSX.Element {
   const host = source.source ?? safeHost(source.url) ?? source.url;
+  const dateLabel = source.updatedAt ? `更新 ${source.updatedAt}` : source.publishedAt ? `发布 ${source.publishedAt}` : "";
   return (
     <div className="web-source-item" title={source.url}>
       <span className="web-source-rank">{index + 1}</span>
       <span>
         <strong>{source.title}</strong>
-        <small>{host}</small>
+        <small>
+          <span>{host}</span>
+          {source.trustLabel ? <b className={`web-source-trust is-${source.trustLabel}`}>{webTrustText(source.trustLabel)}</b> : null}
+          {dateLabel ? <b className="web-source-date">{dateLabel}</b> : null}
+        </small>
         {source.snippet ? <em>{source.snippet}</em> : null}
         <span className="web-source-actions">
           <button type="button" onClick={() => postCommand("fetchUrl", { text: source.url })}>读取正文</button>
@@ -811,6 +843,23 @@ function WebSourceItem({ source, index }: { source: WebSearchSource; index: numb
       </span>
     </div>
   );
+}
+
+function webTrustText(value: NonNullable<WebSearchSource["trustLabel"]>): string {
+  switch (value) {
+    case "official":
+      return "官方";
+    case "docs":
+      return "文档";
+    case "github":
+      return "GitHub";
+    case "news":
+      return "新闻";
+    case "community":
+      return "社区";
+    default:
+      return "未知";
+  }
 }
 
 function safeHost(url: string): string | undefined {
@@ -1466,6 +1515,7 @@ function ChangesPanel(): JSX.Element {
         </section>
       ) : null}
 
+      {extensionState.patch.stagedTask ? <StagedTaskPanel /> : null}
       {activePatch.verifyRepair ? <VerifyRepairPanel patch={activePatch} /> : null}
       {activePatch.plan ? <PatchPlanPanel plan={activePatch.plan} /> : null}
       {activePatch.quality ? <PatchQualityPanel quality={activePatch.quality} /> : null}
@@ -1566,14 +1616,63 @@ function VerifyRepairPanel({ patch }: { patch: PatchDraft }): JSX.Element {
   );
 }
 
-function PatchPlanPanel({ plan }: { plan: PatchPlan }): JSX.Element {
+function StagedTaskPanel(): JSX.Element | null {
+  const { extensionState } = useCodeAgentStore();
+  const task = extensionState.patch.stagedTask;
+  if (!task) {
+    return null;
+  }
+  const current = task.phases[task.currentPhaseIndex];
+  const completed = task.phases.filter((phase) => phase.status === "done").length;
+  const canContinue = Boolean(current && (current.status === "applied" || current.status === "done") && task.status !== "done");
+  const canRetry = Boolean(current && current.status === "failed");
+
   return (
-    <section className="plan-panel" aria-label="执行计划">
+    <section className={classNames("staged-task-panel", `is-${task.status}`)} aria-label="分阶段任务">
+      <header>
+        <div>
+          <span className="staged-task-kicker">分阶段任务</span>
+          <strong>{task.status === "done" ? "全部阶段完成" : current ? `阶段 ${task.currentPhaseIndex + 1}/${task.phaseCount} · ${current.title}` : task.plan.summary}</strong>
+          <small>{completed}/{task.phaseCount} 已完成 · {stagedTaskStatusLabel(task.status)}</small>
+        </div>
+        <div className="staged-task-actions">
+          <button type="button" disabled={!canContinue || extensionState.busy} onClick={() => postCommand("continueStagedTask")}>
+            <Workflow size={13} />
+            继续
+          </button>
+          <button type="button" disabled={!canRetry || extensionState.busy} onClick={() => postCommand("retryStagedPhase", { text: current?.failureReason })}>
+            <RefreshCw size={13} />
+            续跑
+          </button>
+        </div>
+      </header>
+      <ol className="staged-phase-list">
+        {task.phases.map((phase, index) => (
+          <li key={phase.id} className={classNames(`is-${phase.status}`, index === task.currentPhaseIndex && "is-current")}>
+            <span>{stagePhaseIcon(phase.status)}</span>
+            <div>
+              <strong>{index + 1}. {phase.title}</strong>
+              <small>{stagePhaseStatusLabel(phase.status)}{phase.attempt > 0 ? ` · 第 ${phase.attempt} 次` : ""}</small>
+              {phase.files.length > 0 ? <em>{phase.files.join("、")}</em> : null}
+              {phase.failureReason ? <small className="stage-failure">{phase.failureReason}</small> : null}
+            </div>
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
+function PatchPlanPanel({ plan }: { plan: PatchPlan }): JSX.Element {
+  const riskLevel = plan.riskLevel ?? "low";
+  return (
+    <section className={classNames("plan-panel", `is-risk-${riskLevel}`)} aria-label="执行计划">
       <header className="plan-panel-header">
         <div>
           <span className="plan-panel-kicker">执行计划</span>
           <strong>{plan.summary}</strong>
         </div>
+        <span className={classNames("plan-risk-badge", `is-${riskLevel}`)}>{patchRiskLabel(riskLevel)}</span>
       </header>
       <div className="plan-panel-grid">
         <div className="plan-panel-block">
@@ -1592,6 +1691,20 @@ function PatchPlanPanel({ plan }: { plan: PatchPlan }): JSX.Element {
             {plan.steps.length > 0 ? plan.steps.map((step) => <li key={step}>{step}</li>) : <li>先定位最小修改点</li>}
           </ol>
         </div>
+        {(plan.checkpoints ?? []).length > 0 ? (
+          <div className="plan-panel-block">
+            <span>检查点</span>
+            <ol className="plan-checkpoints">
+              {(plan.checkpoints ?? []).map((checkpoint) => (
+                <li key={checkpoint.id || checkpoint.title}>
+                  <strong>{checkpoint.title}</strong>
+                  {checkpoint.files.length > 0 ? <span>{checkpoint.files.join("、")}</span> : null}
+                  {checkpoint.acceptanceCriteria.length > 0 ? <small>{checkpoint.acceptanceCriteria.join("；")}</small> : null}
+                </li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
         <div className="plan-panel-block">
           <span>验收标准</span>
           <ol className="plan-list">
@@ -1631,6 +1744,16 @@ function PatchPlanPanel({ plan }: { plan: PatchPlan }): JSX.Element {
       </div>
     </section>
   );
+}
+
+function patchRiskLabel(level: NonNullable<PatchPlan["riskLevel"]>): string {
+  if (level === "high") {
+    return "高风险";
+  }
+  if (level === "medium") {
+    return "中风险";
+  }
+  return "低风险";
 }
 
 function PatchQualityPanel({ quality }: { quality: PatchQualityReport }): JSX.Element {
@@ -2624,6 +2747,15 @@ function taskKindLabel(kind: "chat" | "agent" | "apply" | "verify" | "capability
   }
 }
 
+function canContinueStagedTask(task: ReturnType<typeof useCodeAgentStore.getState>["extensionState"]["patch"]["stagedTask"]): boolean {
+  const current = task?.phases[task.currentPhaseIndex];
+  return Boolean(current && task?.status !== "done" && (current.status === "applied" || current.status === "done"));
+}
+
+function isCurrentStageFailed(task: ReturnType<typeof useCodeAgentStore.getState>["extensionState"]["patch"]["stagedTask"]): boolean {
+  return task?.phases[task.currentPhaseIndex]?.status === "failed";
+}
+
 function SectionTitle({ title }: { title: string }): JSX.Element {
   return <h2 className="section-title">{title}</h2>;
 }
@@ -2668,6 +2800,12 @@ function getDisabledReason(action: ActionItem, state: ReturnType<typeof useCodeA
   }
   if (action.requiresPatch && !state.patch.pendingPatch) {
     return "暂无待确认修改";
+  }
+  if (action.requiresStagedTask && !canContinueStagedTask(state.patch.stagedTask)) {
+    return "当前阶段尚未完成或没有下一阶段";
+  }
+  if (action.requiresFailedStage && !isCurrentStageFailed(state.patch.stagedTask)) {
+    return "当前阶段没有失败状态";
   }
   if (action.id === "apply" && state.patch.pendingPatch?.quality?.status === "fail") {
     return "质量审查未通过，先修复草稿再应用";
@@ -2822,6 +2960,55 @@ function changeStatusClass(status: ChangeStatus): string {
     return "is-live";
   }
   return "is-empty";
+}
+
+function stagedTaskStatusLabel(status: "active" | "failed" | "done"): string {
+  switch (status) {
+    case "done":
+      return "已完成";
+    case "failed":
+      return "当前阶段失败";
+    case "active":
+    default:
+      return "执行中";
+  }
+}
+
+function stagePhaseStatusLabel(status: "pending" | "generating" | "ready" | "applied" | "verifying" | "failed" | "done"): string {
+  switch (status) {
+    case "pending":
+      return "待执行";
+    case "generating":
+      return "生成中";
+    case "ready":
+      return "待应用";
+    case "applied":
+      return "已应用";
+    case "verifying":
+      return "验证中";
+    case "failed":
+      return "失败";
+    case "done":
+      return "完成";
+  }
+}
+
+function stagePhaseIcon(status: "pending" | "generating" | "ready" | "applied" | "verifying" | "failed" | "done"): string {
+  switch (status) {
+    case "done":
+      return "✓";
+    case "failed":
+      return "!";
+    case "generating":
+    case "verifying":
+      return "…";
+    case "ready":
+    case "applied":
+      return "•";
+    case "pending":
+    default:
+      return "";
+  }
 }
 
 function diffLineClass(line: string): string {

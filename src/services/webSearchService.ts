@@ -9,6 +9,7 @@ import {
   parseSogouHtmlResults
 } from "./webSearchParsing";
 import { rankAndFilterSearchResults } from "./webSearchRelevance";
+import { annotateWebSearchResult, WebSearchTrustLabel } from "./webSearchTrust";
 
 export interface WebSearchRequest {
   sessionId: string;
@@ -27,6 +28,8 @@ export interface WebSearchResult {
   updatedAt?: string;
   rank: number;
   isOfficial?: boolean;
+  trustLabel?: WebSearchTrustLabel;
+  citation?: string;
 }
 
 export interface WebPageContent {
@@ -102,7 +105,9 @@ export class WebSearchService {
       onStatus: options.onStatus,
       originalQuery: query,
       sourceHint
-    }), query, sourceHint).slice(0, maxResults);
+    }), query, sourceHint)
+      .slice(0, maxResults)
+      .map((item) => annotateWebSearchResult(item, sourceHint));
 
     return {
       provider,

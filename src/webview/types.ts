@@ -46,6 +46,11 @@ export interface WebSearchSource {
   url: string;
   snippet?: string;
   source?: string;
+  publishedAt?: string;
+  updatedAt?: string;
+  trustLabel?: "official" | "docs" | "github" | "news" | "community" | "unknown";
+  citation?: string;
+  isOfficial?: boolean;
 }
 
 export interface ChatSession {
@@ -98,6 +103,16 @@ export interface PatchDraft {
   repairOf?: string;
   repairError?: string;
   verifyRepair?: PatchVerifyRepairInfo;
+  stage?: PatchDraftStageInfo;
+}
+
+export interface PatchDraftStageInfo {
+  taskId: string;
+  phaseId: string;
+  phaseIndex: number;
+  phaseCount: number;
+  phaseTitle: string;
+  attempt: number;
 }
 
 export type PatchDraftStatus = "generating" | "reviewing" | "repairing" | "stopped" | "failed";
@@ -114,7 +129,9 @@ export interface PatchVerifyRepairInfo {
 
 export interface PatchPlan {
   summary: string;
+  riskLevel?: "low" | "medium" | "high";
   files: PatchPlanFile[];
+  checkpoints?: PatchPlanCheckpoint[];
   steps: string[];
   acceptanceCriteria: string[];
   verification: string[];
@@ -127,6 +144,14 @@ export interface PatchPlanFile {
   path: string;
   reason: string;
   operation?: "create" | "modify" | "delete";
+}
+
+export interface PatchPlanCheckpoint {
+  id: string;
+  title: string;
+  files: string[];
+  acceptanceCriteria: string[];
+  verification: string[];
 }
 
 export type PatchQualityStatus = "pass" | "warn" | "fail";
@@ -155,6 +180,38 @@ export interface PatchState {
   lastBackupId?: string;
   lastApplyError?: string;
   repairCount: number;
+  stagedTask?: StagedTaskState;
+}
+
+export type StagedTaskStatus = "active" | "failed" | "done";
+export type StagedTaskPhaseStatus = "pending" | "generating" | "ready" | "applied" | "verifying" | "failed" | "done";
+
+export interface StagedTaskState {
+  id: string;
+  request: string;
+  plan: PatchPlan;
+  status: StagedTaskStatus;
+  currentPhaseIndex: number;
+  phaseCount: number;
+  phases: StagedTaskPhase[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StagedTaskPhase {
+  id: string;
+  title: string;
+  files: string[];
+  acceptanceCriteria: string[];
+  verification: string[];
+  status: StagedTaskPhaseStatus;
+  attempt: number;
+  draftId?: string;
+  patchFiles?: string[];
+  failureReason?: string;
+  startedAt?: string;
+  completedAt?: string;
+  updatedAt: string;
 }
 
 export interface EditorContextSummary {
@@ -361,6 +418,8 @@ export type WebviewCommand =
   | "explainInline"
   | "generatePatch"
   | "applyPatch"
+  | "continueStagedTask"
+  | "retryStagedPhase"
   | "applySelectedPatchHunks"
   | "rollbackPatch"
   | "discardPatch"

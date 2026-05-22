@@ -31,6 +31,11 @@ export interface ChatTranscriptItem {
     url: string;
     snippet?: string;
     source?: string;
+    publishedAt?: string;
+    updatedAt?: string;
+    trustLabel?: "official" | "docs" | "github" | "news" | "community" | "unknown";
+    citation?: string;
+    isOfficial?: boolean;
   }>;
   status?: Exclude<ChatProgressStatus, "pending">;
   progressSteps?: ChatProgressStep[];

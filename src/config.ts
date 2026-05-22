@@ -774,7 +774,10 @@ function builtinSkills(): AgentCapabilityConfig[] {
     { id: "tests", label: "测试生成", description: "补充单元测试、集成测试或验证步骤", kind: "builtin" },
     { id: "docs", label: "文档生成", description: "生成注释、README 或使用说明", kind: "builtin" },
     { id: "perf", label: "性能优化", description: "分析热点路径和资源消耗", kind: "builtin" },
-    { id: "security", label: "安全检查", description: "检查输入校验、权限和敏感信息风险", kind: "builtin" }
+    { id: "security", label: "安全检查", description: "检查输入校验、权限和敏感信息风险", kind: "builtin" },
+    { id: "engineering-plan", label: "工程化计划", description: "为复杂任务拆分阶段、文件边界、验收标准和验证策略", kind: "builtin" },
+    { id: "refactor", label: "重构迁移", description: "按兼容层、调用点、测试和清理顺序推进重构或迁移", kind: "builtin" },
+    { id: "quality-gate", label: "质量门禁", description: "强化风险、回滚、测试覆盖和发布前检查", kind: "builtin" }
   ];
 }
 
@@ -788,6 +791,10 @@ function builtinTools(): AgentCapabilityConfig[] {
     { id: "github-search", label: "GitHub 搜索", description: "优先搜索仓库、Issue、Release 和 Discussion", kind: "builtin" },
     { id: "news-search", label: "最新消息搜索", description: "优先搜索 Release、Changelog 和近期公告", kind: "builtin" },
     { id: "tests", label: "测试运行器", description: "执行配置好的验证命令", kind: "builtin" },
+    { id: "task-plan", label: "任务编排", description: "为复杂编码任务维护阶段、检查点、多 diff 和失败续跑状态", kind: "builtin" },
+    { id: "repo-map", label: "仓库地图", description: "提供低 token 的项目结构、入口、测试和关键文件摘要", kind: "builtin" },
+    { id: "quality-gate", label: "质量门禁", description: "检查计划、diff 范围、风险和验证是否满足工程化要求", kind: "builtin" },
+    { id: "failure-memory", label: "失败记忆", description: "召回历史验证失败、命令错误和修复策略，减少重复定位", kind: "builtin" },
     { id: "mcp", label: "MCP 工具", description: "连接 MCP 协议的外部工具", kind: "builtin" },
     { id: "custom", label: "自定义工具", description: "预留团队内部工具或业务系统入口", kind: "builtin" }
   ];

@@ -10,12 +10,14 @@ import { AgentOrchestrator } from "../services/agentOrchestrator";
 import { AgentToolLoop } from "../services/agentToolLoop";
 import { CapabilityRunner, CapabilityRunResult } from "../services/capabilityRunner";
 import { CapabilityRunRecord, CapabilityRunStatus, ChatMode, ChatSession, ChatSessionService, ChatSessionTaskState, ChatTranscriptItem } from "../services/chatSessionService";
+import { FailureMemorySource, FailureMemoryStore, formatFailureMemoryForPrompt } from "../services/failureMemory";
 import { GitService } from "../services/gitService";
 import { McpClientService, McpDiscoveredServerCatalog } from "../services/mcpClient";
 import { PatchWorkflowService } from "../services/patchWorkflow";
 import { VerifyResult, VerifyService, VerifySuiteResult } from "../services/verifyService";
 import { WebSearchResponse, WebSearchService } from "../services/webSearchService";
 import { formatWebSearchError } from "../services/webSearchErrors";
+import { webSearchTrustLabel } from "../services/webSearchTrust";
 import { collectWorkspaceContext, WorkspaceContext } from "../services/workspaceContext";
 import { collectPromptFileReferences, getPreferredReferenceFiles, openWorkspaceFile, readWorkspaceFile, WorkspaceFileSummary } from "../services/workspaceFiles";
 
@@ -56,6 +58,8 @@ type WebviewMessageType =
   | "explainInline"
   | "generatePatch"
   | "applyPatch"
+  | "continueStagedTask"
+  | "retryStagedPhase"
   | "applySelectedPatchHunks"
   | "rollbackPatch"
   | "discardPatch"
@@ -163,7 +167,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly mcpClient: McpClientService,
     private readonly agentOrchestrator: AgentOrchestrator,
     private readonly agentToolLoop: AgentToolLoop,
-    private readonly verifyService: VerifyService
+    private readonly verifyService: VerifyService,
+    private readonly failureMemoryStore: FailureMemoryStore
   ) {}
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -214,6 +219,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.agentOrchestrator,
       this.agentToolLoop,
       this.verifyService,
+      this.failureMemoryStore,
       this.runningTasks,
       session,
       () => this.refreshState(),
@@ -362,6 +368,7 @@ class ChatPanel {
     private readonly agentOrchestrator: AgentOrchestrator,
     private readonly agentToolLoop: AgentToolLoop,
     private readonly verifyService: VerifyService,
+    private readonly failureMemoryStore: FailureMemoryStore,
     private readonly runningTasks: Map<string, RunningSessionTask>,
     private session: ChatSession,
     private readonly onStateChange: () => void,
@@ -737,6 +744,16 @@ class ChatPanel {
         return;
       }
 
+      if (message.type === "continueStagedTask") {
+        await this.handleContinueStagedTask();
+        return;
+      }
+
+      if (message.type === "retryStagedPhase") {
+        await this.handleRetryStagedPhase(message.text);
+        return;
+      }
+
       if (message.type === "previewPatch") {
         const approved = await this.approvals.ensureToolApproval({
           sessionId: this.session.id,
@@ -782,7 +799,10 @@ class ChatPanel {
               this.appendProgressEvent("写入工作区文件", "done", `${result.appliedFiles ?? 0} 个文件`, "file");
               await this.completeProgressMessage("修改已应用", `${result.appliedFiles ?? 0} 个文件`);
               await this.appendAssistant(`修改已应用到 ${result.appliedFiles ?? 0} 个文件。`, "local");
-              await this.runPostApplyVerificationIfConfigured(applyAbortController.signal, result.appliedDraft);
+              const verificationPassed = await this.runPostApplyVerificationIfConfigured(applyAbortController.signal, result.appliedDraft);
+              if (verificationPassed) {
+                await this.continueStagedTaskAfterVerified(applyAbortController.signal);
+              }
             } else if (result.status === "repaired" && result.repairedDraft) {
               this.appendProgressEvent("整理应用结果", "error", result.error, "patch");
               await this.failProgressMessage("应用失败，已生成修复草稿。");
@@ -1317,6 +1337,7 @@ class ChatPanel {
       ...response.results.flatMap((item, index) => [
         `${index + 1}. ${item.title}`,
         `URL: ${item.url}`,
+        item.trustLabel ? `可信度：${webSearchTrustLabel(item.trustLabel)}${item.citation ? ` | ${item.citation}` : ""}` : "",
         item.source ? `来源站点：${item.source}` : "",
         item.updatedAt ? `更新时间：${item.updatedAt}` : item.publishedAt ? `发布时间：${item.publishedAt}` : "",
         item.snippet ? `摘要：${item.snippet}` : "",
@@ -1335,7 +1356,12 @@ class ChatPanel {
         title: item.title,
         url: item.url,
         snippet: item.snippet,
-        source: item.source
+        source: item.source,
+        publishedAt: item.publishedAt,
+        updatedAt: item.updatedAt,
+        trustLabel: item.trustLabel,
+        citation: item.citation,
+        isOfficial: item.isOfficial
       }))
     });
   }
@@ -1423,7 +1449,7 @@ class ChatPanel {
   }
 
   private async trySearchForAgent(prompt: string, capabilityContext: CapabilityContext, signal: AbortSignal): Promise<string | undefined> {
-    if (!shouldAgentUseWebSearch(prompt, capabilityContext) || !this.webSearch.isEnabled()) {
+    if (!hasSelectedWebSearchTool(capabilityContext) || !this.webSearch.isEnabled()) {
       this.appendProgressEvent("联网搜索资料", "done", "未启用或当前任务不需要联网资料", "tool");
       return undefined;
     }
@@ -1448,7 +1474,7 @@ class ChatPanel {
 
     try {
       this.appendProgressEvent("联网搜索资料", "running", query, "tool");
-      const sourceHint = inferSearchSourceHint(query);
+      const sourceHint = inferAgentSearchSourceHint(query, capabilityContext);
       const response = await this.webSearch.search({
         sessionId: this.session.id,
         query,
@@ -1558,7 +1584,7 @@ class ChatPanel {
   }
 
   private async handleSessionVerify(autoFix: boolean): Promise<void> {
-    const commands = this.verifyService.getConfiguredCommands();
+    const commands = this.verifyService.getScopedCommands(this.getPendingPatchFiles()).commands;
     if (commands.length === 0) {
       await this.appendAssistant("还没有配置验证命令。请在设置中配置 `codeAgent.verify.commands`，例如 `npm test`。", "local");
       return;
@@ -1601,6 +1627,9 @@ class ChatPanel {
         );
         this.appendProgressEvent("整理验证输出", "done", "结果已写入当前会话", "think");
         await this.appendAssistant(formatVerifySuiteResult(suite), "local");
+        if (!suite.aborted && !suite.passed) {
+          await this.recordVerifyFailureMemory(suite, "manualVerify", this.getPendingPatchFiles());
+        }
         if (autoFix && !suite.aborted && !suite.passed) {
           const maxRepairAttempts = getAgentMaxRepairAttempts();
           if (maxRepairAttempts <= 0) {
@@ -1683,12 +1712,14 @@ class ChatPanel {
           signal: abortController.signal,
           onProgress: (label, status, detail, kind) => this.appendProgressEvent(label, status, detail, kind)
         });
+        const preSearchContext = await this.trySearchForAgent(prompt.trim(), capabilityContext, abortController.signal);
         const toolLoop = await this.agentToolLoop.run({
           prompt: prompt.trim(),
           transcript: this.transcript,
           capabilityContext,
           baseContext: preparation.contextBlock,
           previousPlanContext: agentMemory.planBlock,
+          webContext: preSearchContext,
           signal: abortController.signal,
           onProgress: (label, status, detail, kind) => this.appendProgressEvent(label, status, detail, kind),
           runWebSearch: async (query) => {
@@ -1709,7 +1740,7 @@ class ChatPanel {
           prompt.trim(),
           this.transcript,
           capabilityContext,
-          undefined,
+          preSearchContext,
           mergeToolContext(preparation.contextBlock, toolLoop.contextBlock),
           agentMemory
         );
@@ -1873,7 +1904,7 @@ class ChatPanel {
   }
 
   private async runVerifyForAgent(signal: AbortSignal): Promise<string | undefined> {
-    const commands = this.verifyService.getConfiguredCommands();
+    const commands = this.verifyService.getScopedCommands(this.getPendingPatchFiles()).commands;
     if (commands.length === 0) {
       return "没有配置验证命令。";
     }
@@ -1883,20 +1914,26 @@ class ChatPanel {
     }
     const suite = await this.verifyService.runSuite({ commands: approvedCommands, signal, stopOnFailure: true });
     await this.appendAssistant(formatVerifySuiteResult(suite), "local");
-    return formatVerifySuiteResult(suite);
+    if (!suite.aborted && !suite.passed) {
+      await this.recordVerifyFailureMemory(suite, "agentVerify", this.getPendingPatchFiles());
+    }
+    return formatVerifySuiteResult(suite, { compact: true });
   }
 
-  private async runPostApplyVerificationIfConfigured(signal: AbortSignal, appliedDraft?: Awaited<ReturnType<PatchWorkflowService["generatePatch"]>>): Promise<void> {
-    const commands = this.verifyService.getConfiguredCommands();
+  private async runPostApplyVerificationIfConfigured(signal: AbortSignal, appliedDraft?: Awaited<ReturnType<PatchWorkflowService["generatePatch"]>>): Promise<boolean> {
+    const commands = this.verifyService.getScopedCommands(appliedDraft?.files).commands;
     if (commands.length === 0) {
       this.appendProgressEvent("应用后验证", "done", "未配置验证命令", "verify");
-      return;
+      return true;
     }
 
     const approvedCommands = await this.approveVerifyCommands(commands, "应用后验证", "修改应用后自动验证，失败时生成新的可审查修复草稿。");
     if (approvedCommands.length === 0) {
       this.appendProgressEvent("应用后验证", "error", "用户拒绝运行验证", "verify");
-      return;
+      if (appliedDraft?.stage) {
+        this.patchWorkflow.markCurrentStageFailed("用户拒绝运行应用后验证。");
+      }
+      return false;
     }
 
     this.beginProgressMessage("正在应用后验证", [
@@ -1904,6 +1941,10 @@ class ChatPanel {
       { label: "分析验证结果", kind: "think" },
       { label: "生成修复草稿", kind: "patch" }
     ]);
+    if (appliedDraft?.stage) {
+      this.patchWorkflow.markCurrentStageVerifying();
+      this.postState();
+    }
     const suite = await this.verifyService.runSuite({
       commands: approvedCommands,
       signal,
@@ -1925,6 +1966,10 @@ class ChatPanel {
     this.appendProgressEvent("分析验证结果", "done", "验证结果已写入会话", "think");
     await this.appendAssistant(formatVerifySuiteResult(suite), "local");
     if (!suite.aborted && !suite.passed) {
+      await this.recordVerifyFailureMemory(suite, "postApply", appliedDraft?.files);
+      if (appliedDraft?.stage) {
+        this.patchWorkflow.markCurrentStageFailed(getVerifyFailureSummary(suite) ?? "应用后验证未通过。");
+      }
       const maxRepairAttempts = getAgentMaxRepairAttempts();
       const previousRound = appliedDraft?.verifyRepair?.round ?? 0;
       const nextRound = previousRound + 1;
@@ -1937,25 +1982,171 @@ class ChatPanel {
         );
         await this.completeProgressMessage("应用后验证未通过", "已达到修复上限，请查看验证输出后手动处理");
         await this.appendAssistant(buildRepairLimitMessage(suite, previousRound, maxRepairAttempts), "local");
-        return;
+        return false;
       }
       const draft = await this.generateVerifyRepairDraft(suite, signal, {
         round: nextRound,
         maxRounds: maxRepairAttempts,
-        source: "postApply"
+        source: "postApply",
+        stage: appliedDraft?.stage
       });
       await this.completeProgressMessage(`应用后验证未通过，已生成第 ${nextRound}/${maxRepairAttempts} 轮修复草稿`, draft.files.join("、"));
       await this.appendAssistant(formatPatchReadyMessage(draft), "local");
-      return;
+      return false;
     }
     this.appendProgressEvent("生成修复草稿", "done", "验证通过，无需修复", "patch");
     await this.completeProgressMessage("应用后验证通过", `${suite.results.length} 条命令`);
+    if (appliedDraft?.stage) {
+      this.patchWorkflow.markCurrentStageDone();
+      this.postState();
+    }
+    return true;
+  }
+
+  private async continueStagedTaskAfterVerified(signal: AbortSignal): Promise<void> {
+    if (!this.patchWorkflow.canContinueStagedTask()) {
+      if (this.patchWorkflow.isStagedTaskComplete()) {
+        await this.appendAssistant("分阶段任务已全部完成。", "local");
+      }
+      return;
+    }
+
+    this.beginProgressMessage("正在生成下一阶段草稿", [
+      { label: "读取工作区上下文", kind: "file" },
+      { label: "整理引用文件", kind: "file" },
+      { label: "制定执行计划", kind: "think" },
+      { label: "请求模型生成修改", kind: "model" },
+      { label: "解析修改草稿", kind: "patch" },
+      { label: "等待你确认应用", kind: "approval" }
+    ]);
+    const draft = await this.patchWorkflow.generateNextStagedPatch({
+      signal,
+      onProgress: (progress) => this.updateProgressMessage(progress.label, progress.detail, progressKindForStage(progress.stage)),
+      onDraft: (draft, draftStatus, detail) => {
+        this.appendProgressEvent(
+          "生成下一阶段草稿",
+          draftStatus === "failed" || draftStatus === "stopped" ? "error" : "running",
+          detail ?? `${draft.fileCount} 个文件`,
+          "patch"
+        );
+        this.postState();
+      }
+    });
+    if (!draft) {
+      await this.completeProgressMessage("分阶段任务已完成", "没有后续阶段");
+      await this.appendAssistant("分阶段任务已全部完成。", "local");
+      return;
+    }
+    await this.completeProgressMessage(`已生成阶段 ${draft.stage?.phaseIndex ?? "下一"} 修改草稿`, draft.files.join("、"));
+    await this.appendAssistant(formatPatchReadyMessage(draft), "local");
+  }
+
+  private async handleContinueStagedTask(): Promise<void> {
+    if (!this.patchWorkflow.canContinueStagedTask()) {
+      await this.appendAssistant("当前没有可继续的分阶段任务。", "local");
+      return;
+    }
+
+    const approved = await this.approvals.ensureToolApproval({
+      sessionId: this.session.id,
+      toolId: "files",
+      label: "文件读写",
+      reason: "继续生成分阶段任务的下一份可审查 diff"
+    });
+    if (approved !== "approved") {
+      this.postState();
+      return;
+    }
+
+    const abortController = new AbortController();
+    await this.beginRunningTask("agent", "正在继续阶段任务", abortController);
+    this.beginProgressMessage("正在继续阶段任务", [
+      { label: "读取工作区上下文", kind: "file" },
+      { label: "整理引用文件", kind: "file" },
+      { label: "制定执行计划", kind: "think" },
+      { label: "请求模型生成修改", kind: "model" },
+      { label: "解析修改草稿", kind: "patch" },
+      { label: "等待你确认应用", kind: "approval" }
+    ]);
+    try {
+      await this.runLocalTask("正在继续阶段任务", async () => {
+        const draft = await this.patchWorkflow.generateNextStagedPatch({
+          signal: abortController.signal,
+          onProgress: (progress) => this.updateProgressMessage(progress.label, progress.detail, progressKindForStage(progress.stage)),
+          onDraft: (draft, draftStatus, detail) => {
+            this.appendProgressEvent(
+              "实时生成修改",
+              draftStatus === "failed" || draftStatus === "stopped" ? "error" : "running",
+              detail ?? `${draft.fileCount} 个文件`,
+              "patch"
+            );
+            this.postState();
+          }
+        });
+        if (!draft) {
+          await this.completeProgressMessage("分阶段任务已完成", "没有后续阶段");
+          await this.appendAssistant("分阶段任务已全部完成。", "local");
+          return;
+        }
+        await this.completeProgressMessage(`已生成阶段 ${draft.stage?.phaseIndex ?? "下一"} 修改草稿`, draft.files.join("、"));
+        await this.appendAssistant(formatPatchReadyMessage(draft), "local");
+      });
+    } finally {
+      await this.clearRunningTask(abortController);
+      this.postState();
+    }
+  }
+
+  private async handleRetryStagedPhase(reason?: string): Promise<void> {
+    const approved = await this.approvals.ensureToolApproval({
+      sessionId: this.session.id,
+      toolId: "files",
+      label: "文件读写",
+      reason: "重新生成当前失败阶段的可审查 diff"
+    });
+    if (approved !== "approved") {
+      this.postState();
+      return;
+    }
+
+    const abortController = new AbortController();
+    await this.beginRunningTask("agent", "正在续跑当前阶段", abortController);
+    this.beginProgressMessage("正在续跑当前阶段", [
+      { label: "读取工作区上下文", kind: "file" },
+      { label: "整理引用文件", kind: "file" },
+      { label: "制定执行计划", kind: "think" },
+      { label: "请求模型生成修改", kind: "model" },
+      { label: "解析修改草稿", kind: "patch" },
+      { label: "等待你确认应用", kind: "approval" }
+    ]);
+    try {
+      await this.runLocalTask("正在续跑当前阶段", async () => {
+        const draft = await this.patchWorkflow.retryCurrentStagedPatch(reason?.trim() || "用户请求续跑当前失败阶段。", {
+          signal: abortController.signal,
+          onProgress: (progress) => this.updateProgressMessage(progress.label, progress.detail, progressKindForStage(progress.stage)),
+          onDraft: (draft, draftStatus, detail) => {
+            this.appendProgressEvent(
+              "实时生成修改",
+              draftStatus === "failed" || draftStatus === "stopped" ? "error" : "running",
+              detail ?? `${draft.fileCount} 个文件`,
+              "patch"
+            );
+            this.postState();
+          }
+        });
+        await this.completeProgressMessage(`已续跑阶段 ${draft.stage?.phaseIndex ?? ""}`, draft.files.join("、"));
+        await this.appendAssistant(formatPatchReadyMessage(draft), "local");
+      });
+    } finally {
+      await this.clearRunningTask(abortController);
+      this.postState();
+    }
   }
 
   private async generateVerifyRepairDraft(
     result: VerifyResult | VerifySuiteResult,
     signal: AbortSignal,
-    repairInfo: { round: number; maxRounds: number; source: "manualVerify" | "postApply" }
+    repairInfo: { round: number; maxRounds: number; source: "manualVerify" | "postApply"; stage?: Awaited<ReturnType<PatchWorkflowService["generatePatch"]>>["stage"] }
   ): Promise<Awaited<ReturnType<PatchWorkflowService["generatePatch"]>>> {
     this.appendProgressEvent("生成修复草稿", "running", `第 ${repairInfo.round}/${repairInfo.maxRounds} 轮，生成可审查草稿`, "patch");
     const fixPrompt = buildVerifyFixPrompt(result);
@@ -1967,12 +2158,28 @@ class ChatPanel {
       signal,
       onProgress: (label, stepStatus, detail, kind) => this.appendProgressEvent(label, stepStatus, detail, kind)
     });
-    const agentRequest = buildAgentRequestWithHistory(fixPrompt, this.transcript, capabilityContext, undefined, preparation.contextBlock);
+    const failureMemoryContext = formatFailureMemoryForPrompt(this.failureMemoryStore.getRelevant({
+      prompt: fixPrompt,
+      files: this.getPendingPatchFiles(),
+      command: getVerifyFailedCommand(result),
+      failureKind: getVerifyFailureKind(result)
+    }, 4), Math.min(2200, getAgentContextBudget().toolOutputChars));
+    const agentRequest = buildAgentRequestWithHistory(
+      fixPrompt,
+      this.transcript,
+      capabilityContext,
+      undefined,
+      mergeToolContext(preparation.contextBlock, failureMemoryContext)
+    );
     const draft = await this.patchWorkflow.generatePatch(agentRequest, {
       signal,
+      staged: "off",
       draftMetadata: {
+        stage: repairInfo.stage,
         verifyRepair: {
-          ...repairInfo,
+          round: repairInfo.round,
+          maxRounds: repairInfo.maxRounds,
+          source: repairInfo.source,
           failedCommand: getVerifyFailedCommand(result),
           failureKind: getVerifyFailureKind(result),
           summary: getVerifyFailureSummary(result),
@@ -2381,6 +2588,23 @@ class ChatPanel {
     });
   }
 
+  private getPendingPatchFiles(): string[] {
+    return this.patchWorkflow.getState().pendingPatch?.files ?? [];
+  }
+
+  private async recordVerifyFailureMemory(
+    result: VerifyResult | VerifySuiteResult,
+    source: FailureMemorySource,
+    files: string[] = this.getPendingPatchFiles()
+  ): Promise<void> {
+    await this.failureMemoryStore.record({
+      result,
+      source,
+      files,
+      prompt: this.transcript.filter((item) => item.role === "user").at(-1)?.content
+    }).catch(() => undefined);
+  }
+
 }
 
 function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, view: WebviewKind): string {
@@ -2650,11 +2874,8 @@ function collectAgentRelevantHistory(transcript: ChatTranscriptItem[]): string {
   return compactHistoryText(lines.join("\n"), budget.historyChars);
 }
 
-function shouldAgentUseWebSearch(prompt: string, capabilityContext: CapabilityContext): boolean {
-  if (capabilityContext.tools.some((tool) => ["web-search", "docs-search", "github-search", "news-search"].includes(tool.id))) {
-    return true;
-  }
-  return /最新|官方文档|文档|搜索|联网|查一下|查找|release|changelog|api\s*变化|版本|报错|错误码|依赖|npm|sdk|breaking/i.test(prompt);
+function hasSelectedWebSearchTool(capabilityContext: CapabilityContext): boolean {
+  return capabilityContext.tools.some((tool) => ["web-search", "docs-search", "github-search", "news-search"].includes(tool.id));
 }
 
 function buildAgentSearchQuery(prompt: string): string {
@@ -2678,6 +2899,20 @@ function inferSearchSourceHint(query: string): "general" | "docs" | "news" | "gi
   return "general";
 }
 
+function inferAgentSearchSourceHint(query: string, capabilityContext: CapabilityContext): "general" | "docs" | "news" | "github" {
+  const toolIds = new Set(capabilityContext.tools.map((tool) => tool.id));
+  if (toolIds.has("docs-search")) {
+    return "docs";
+  }
+  if (toolIds.has("github-search")) {
+    return "github";
+  }
+  if (toolIds.has("news-search")) {
+    return "news";
+  }
+  return inferSearchSourceHint(query);
+}
+
 function formatWebSearchForPrompt(response: WebSearchResponse): string {
   const lines = [
     `Query: ${response.query}`,
@@ -2688,6 +2923,8 @@ function formatWebSearchForPrompt(response: WebSearchResponse): string {
     ...response.results.slice(0, getAgentContextBudget().webResults).flatMap((item, index) => [
       `${index + 1}. ${item.title}`,
       `URL: ${item.url}`,
+      item.trustLabel ? `Trust: ${item.trustLabel}` : "",
+      item.citation ? `Citation: ${item.citation}` : "",
       item.source ? `Source: ${item.source}` : "",
       item.updatedAt ? `Updated: ${item.updatedAt}` : item.publishedAt ? `Published: ${item.publishedAt}` : "",
       `Summary: ${compactHistoryText(item.snippet, getAgentContextBudget().webSnippetChars)}`,
@@ -2789,6 +3026,27 @@ function buildCapabilityContextBlock(context: CapabilityContext): string {
   }
   if (context.tools.length > 0) {
     lines.push(`已选择工具：${context.tools.map((item) => `${item.label}${item.kind === "mcp" && item.server ? ` [${item.server}]` : ""}`).join("、")}`);
+  }
+  const selectedIds = new Set([...context.skills, ...context.tools].map((item) => item.id));
+  const engineeringHints = [
+    selectedIds.has("engineering-plan") || selectedIds.has("task-plan")
+      ? "- 工程化计划：复杂任务必须拆成可单独审查、应用和验证的阶段，避免一次生成过大的 diff。"
+      : "",
+    selectedIds.has("refactor")
+      ? "- 重构迁移：优先保持兼容，按接口/调用点/测试/清理顺序推进，不要一次性重写无关模块。"
+      : "",
+    selectedIds.has("quality-gate")
+      ? "- 质量门禁：计划需要包含风险、验收、验证和回滚考虑；高风险任务缺少验证时应先补计划。"
+      : "",
+    selectedIds.has("repo-map")
+      ? "- 仓库地图：优先利用工作区索引、入口、测试文件和已有项目约定，减少重复读取。"
+      : "",
+    selectedIds.has("failure-memory")
+      ? "- 失败记忆：遇到同类验证失败时优先参考历史失败摘要和修复策略。"
+      : ""
+  ].filter(Boolean);
+  if (engineeringHints.length > 0) {
+    lines.push(["工程化能力约束：", ...engineeringHints].join("\n"));
   }
   return lines.join("\n");
 }
@@ -3405,12 +3663,16 @@ function formatVerifyResult(result: {
   command: string;
   exitCode: number | null;
   output: string;
+  keyLines?: string[];
   durationMs: number;
   aborted?: boolean;
   failureKind?: VerifyResult["failureKind"];
   summary?: string;
-}): string {
+}, options: { compact?: boolean } = {}): string {
   const status = result.aborted ? "已停止" : result.exitCode === 0 ? "通过" : "未通过";
+  const output = options.compact && result.keyLines?.length
+    ? result.keyLines.join("\n")
+    : result.output;
   return [
     `验证结果：${status}`,
     "",
@@ -3419,21 +3681,27 @@ function formatVerifyResult(result: {
     `- 耗时：${formatDuration(result.durationMs)}`,
     result.failureKind && result.failureKind !== "pass" ? `- 失败类型：${verifyFailureKindLabel(result.failureKind)}` : "",
     result.summary ? `- 摘要：${result.summary}` : "",
+    options.compact && result.keyLines?.length ? "- 输出已压缩为关键错误行" : "",
     "",
     "输出：",
     "",
     "```text",
-    compactHistoryText(result.output, getAgentContextBudget().verifyOutputChars),
+    compactHistoryText(output, getAgentContextBudget().verifyOutputChars),
     "```"
   ].filter(Boolean).join("\n");
 }
 
-function formatVerifySuiteResult(suite: VerifySuiteResult): string {
+function formatVerifySuiteResult(suite: VerifySuiteResult, options: { compact?: boolean } = {}): string {
   if (suite.results.length === 1) {
-    return formatVerifyResult(suite.results[0]);
+    return formatVerifyResult(suite.results[0], options);
   }
   const status = suite.aborted ? "已停止" : suite.passed ? "通过" : "未通过";
   const budget = getAgentContextBudget();
+  const output = suite.results.map((result) => [
+    `$ ${result.command}`,
+    `exit ${result.exitCode ?? "n/a"} · ${result.summary ?? ""}`,
+    options.compact && result.keyLines?.length ? result.keyLines.join("\n") : result.output
+  ].join("\n")).join("\n\n");
   return [
     `验证套件结果：${status}`,
     "",
@@ -3441,6 +3709,7 @@ function formatVerifySuiteResult(suite: VerifySuiteResult): string {
     `- 耗时：${formatDuration(suite.durationMs)}`,
     suite.failedCommand ? `- 首个失败命令：\`${suite.failedCommand}\`` : "",
     `- 失败类型：${verifyFailureKindLabel(suite.failureKind)}`,
+    options.compact ? "- 输出已压缩为关键错误行" : "",
     "",
     "命令摘要：",
     ...suite.results.map((result, index) => [
@@ -3451,11 +3720,7 @@ function formatVerifySuiteResult(suite: VerifySuiteResult): string {
     "输出：",
     "",
     "```text",
-    compactHistoryText(suite.results.map((result) => [
-      `$ ${result.command}`,
-      `exit ${result.exitCode ?? "n/a"} · ${result.summary ?? ""}`,
-      result.output
-    ].join("\n")).join("\n\n"), budget.verifyOutputChars),
+    compactHistoryText(output, budget.verifyOutputChars),
     "```"
   ].filter(Boolean).join("\n");
 }
@@ -3503,7 +3768,7 @@ function buildVerifyFixPrompt(result: VerifyResult | VerifySuiteResult): string 
     const output = result.results.map((item) => [
       `$ ${item.command}`,
       `exit ${item.exitCode ?? "n/a"} · ${item.summary ?? ""}`,
-      item.output
+      item.keyLines?.length ? item.keyLines.join("\n") : item.output
     ].join("\n")).join("\n\n");
     return [
       "请根据当前工作区上下文修复验证失败。",
@@ -3544,7 +3809,7 @@ function buildVerifyFixPrompt(result: VerifyResult | VerifySuiteResult): string 
     "",
     "失败输出：",
     "```text",
-    compactHistoryText(result.output, getAgentContextBudget().verifyOutputChars),
+    compactHistoryText(result.keyLines?.length ? result.keyLines.join("\n") : result.output, getAgentContextBudget().verifyOutputChars),
     "```",
     "",
     "要求：",
@@ -3596,7 +3861,9 @@ function searchSourceHintLabel(value: WebSearchResponse["sourceHint"]): string {
 
 function formatPatchReadyMessage(draft: Awaited<ReturnType<PatchWorkflowService["generatePatch"]>>): string {
   return [
-    `已生成 ${draft.fileCount} 个文件的修改草稿。`,
+    draft.stage
+      ? `已生成阶段 ${draft.stage.phaseIndex}/${draft.stage.phaseCount} 的修改草稿：${draft.stage.phaseTitle}。`
+      : `已生成 ${draft.fileCount} 个文件的修改草稿。`,
     "",
     "执行计划：",
     draft.plan
@@ -3609,9 +3876,10 @@ function formatPatchReadyMessage(draft: Awaited<ReturnType<PatchWorkflowService[
       : "- 未生成结构化计划",
     "",
     "请切换到“修改结果”页面查看每个文件的改动，确认后再应用到项目。",
+    draft.stage ? `这是分阶段任务的第 ${draft.stage.phaseIndex}/${draft.stage.phaseCount} 阶段；应用并验证通过后会继续下一阶段。` : "",
     "",
     draft.files.map((file) => `- ${file}`).join("\n")
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function formatDuration(durationMs: number): string {

@@ -3,11 +3,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { getConfig } from "../config";
+import { buildScopedVerifyPlan, ScopedVerifyPlan } from "./verifyPlanner";
 
 export interface VerifyResult {
   command: string;
   exitCode: number | null;
   output: string;
+  keyLines?: string[];
   durationMs: number;
   aborted?: boolean;
   failureKind?: VerifyFailureKind;
@@ -65,6 +67,10 @@ export class VerifyService {
     return normalizeCommands(inspected?.defaultValue ?? ["npm test"]);
   }
 
+  public getScopedCommands(changedFiles: string[] = []): ScopedVerifyPlan {
+    return buildScopedVerifyPlan(this.getConfiguredCommands(), changedFiles);
+  }
+
   public getWorkspaceRoot(): string {
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) {
@@ -88,6 +94,7 @@ export class VerifyService {
           command,
           exitCode,
           output,
+          keyLines: extractVerifyKeyLines(output),
           durationMs: Date.now() - startedAt,
           aborted,
           failureKind,
@@ -249,6 +256,23 @@ export function classifyVerifyFailure(command: string, output: string, exitCode:
   return "unknown";
 }
 
+export function extractVerifyKeyLines(output: string, limit = 10): string[] {
+  const seen = new Set<string>();
+  const usefulLines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .filter((line) => {
+      if (!line || seen.has(line) || isVerifyNoiseLine(line)) {
+        return false;
+      }
+      seen.add(line);
+      return true;
+    });
+
+  const priorityLines = usefulLines.filter((line) => isVerifyPriorityLine(line));
+  return (priorityLines.length > 0 ? priorityLines : usefulLines).slice(0, limit);
+}
+
 function summarizeVerifyResult(command: string, output: string, exitCode: number | null, failureKind: VerifyFailureKind, aborted?: boolean): string {
   if (aborted) {
     return `命令已停止：${command}`;
@@ -256,11 +280,16 @@ function summarizeVerifyResult(command: string, output: string, exitCode: number
   if (exitCode === 0) {
     return `验证通过：${command}`;
   }
-  const firstUsefulLine = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line && !/^(>|npm|yarn|pnpm|$)/i.test(line));
+  const firstUsefulLine = extractVerifyKeyLines(output, 1)[0];
   return `${failureKindLabel(failureKind)}：${firstUsefulLine ?? command}`;
+}
+
+function isVerifyNoiseLine(line: string): boolean {
+  return /^(>|npm|yarn|pnpm|bun|run-script|lifecycle|found \d+ vulnerabilities|audited \d+ packages|added \d+ packages|up to date)/i.test(line);
+}
+
+function isVerifyPriorityLine(line: string): boolean {
+  return /(\berror\b|\bfailed\b|\bfailure\b|\bexpected\b|\breceived\b|\bassert\b|ts\d{4}|eslint|prettier|cannot|not found|exception|traceback|stack trace|:\d+:\d+|^\s*at\s+)/i.test(line);
 }
 
 function failureKindLabel(kind: VerifyFailureKind): string {

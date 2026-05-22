@@ -2,6 +2,7 @@ import { AgentCapabilityConfig, getAgentContextBudget, getAgentMaxToolRounds, ge
 import { ProviderRegistry } from "../providers/registry";
 import { ChatTranscriptItem } from "./chatSessionService";
 import { AgentToolAction, compactText, getToolActionKey, normalizeToolPlan, parsePlannerJson, ParsedToolPlan } from "./agentToolPlan";
+import { formatTextSearchMatches, searchWorkspaceText } from "./workspaceCodeMap";
 import { readWorkspaceFile } from "./workspaceFiles";
 
 export type AgentToolLoopStepStatus = "running" | "done" | "error";
@@ -67,6 +68,22 @@ export class AgentToolLoop {
           break;
         }
         usefulActions += 1;
+        if (action.type === "search_text") {
+          const label = `搜索代码 ${action.query}`;
+          request.onProgress?.(label, "running", action.reason, "file");
+          try {
+            const matches = await searchWorkspaceText(action.query, {
+              maxMatches: Math.max(12, Math.min(40, budget.candidateFiles * 2))
+            });
+            observations.push(`## ${label}\n${formatTextSearchMatches(action.query, matches, Math.min(5000, budget.toolOutputChars))}`);
+            request.onProgress?.(label, "done", `${matches.length} 条匹配`, "file");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            observations.push(`## ${label}\n失败：${message}`);
+            request.onProgress?.(label, "error", message, "file");
+          }
+          continue;
+        }
         if (action.type === "read_file") {
           const label = `读取文件 ${action.path}`;
           request.onProgress?.(label, "running", action.reason, "file");
@@ -211,6 +228,7 @@ function buildPlannerPrompt(request: AgentToolLoopRequest, observations: string[
     "{",
     '  "summary": "中文说明为什么选择这些动作",',
     '  "actions": [',
+    '    { "type": "search_text", "query": "函数名或错误关键词", "reason": "中文原因" },',
     '    { "type": "read_file", "path": "src/example.ts", "reason": "中文原因" },',
     '    { "type": "web_search", "query": "关键词", "reason": "中文原因" },',
     '    { "type": "run_capability", "capabilityId": "mcp:server:tool", "input": "{...}", "reason": "中文原因" },',
@@ -218,10 +236,13 @@ function buildPlannerPrompt(request: AgentToolLoopRequest, observations: string[
     '    { "type": "finish", "reason": "上下文已足够" }',
     "  ]",
     "}",
+    "- Prefer search_text before read_file when you only know a symbol, error keyword, route, or call site. Use read_file after search_text identifies likely files.",
     "",
     "规则：",
     `- 这是第 ${round}/${maxRounds} 轮。最多 4 个动作；如果上下文已足够，请只返回 finish。`,
-    "- 默认优先 read_file，其次 web_search，只有用户选择了具体 Skill/MCP/工具时才 run_capability。",
+    "- 默认优先 search_text 和 repo-map 信息定位，再 read_file；联网搜索只在用户选择搜索工具或任务依赖最新外部信息时使用。",
+    "- 内置 task-plan、quality-gate、repo-map、failure-memory 是编排提示和上下文能力，不是可执行写文件动作；除非它们有脚本或 MCP 路由，否则不要 run_capability。",
+    "- 只有用户选择了具体脚本 Skill、MCP 工具或自定义可执行工具时才 run_capability。",
     "- 只有任务明显需要测试反馈时才 run_verify。",
     "- 不要输出写文件动作。"
   ].filter(Boolean).join("\n");

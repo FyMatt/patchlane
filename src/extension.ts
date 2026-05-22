@@ -11,12 +11,14 @@ import { AgentOrchestrator } from "./services/agentOrchestrator";
 import { AgentToolLoop } from "./services/agentToolLoop";
 import { CapabilityRunner } from "./services/capabilityRunner";
 import { ChatSessionService } from "./services/chatSessionService";
+import { FailureMemoryStore } from "./services/failureMemory";
 import { GitService } from "./services/gitService";
 import { filterPatchHunks, getHunkChoices } from "./services/hunkSelector";
 import { InlineExplainService } from "./services/inlineExplainService";
 import { McpClientService } from "./services/mcpClient";
 import { PatchService } from "./services/patchService";
 import { PatchWorkflowService } from "./services/patchWorkflow";
+import { RepoProfileStore } from "./services/repoProfile";
 import { SecretService } from "./services/secretService";
 import { VerifyService } from "./services/verifyService";
 import { WebSearchService } from "./services/webSearchService";
@@ -30,11 +32,13 @@ export function activate(context: vscode.ExtensionContext): void {
   const verifyService = new VerifyService();
   const workspaceIndexService = new WorkspaceIndexService();
   const chatSessionService = new ChatSessionService(context.workspaceState);
+  const repoProfileStore = new RepoProfileStore(context.workspaceState);
+  const failureMemoryStore = new FailureMemoryStore(context.workspaceState);
   const approvalService = new ApprovalService();
   const mcpClientService = new McpClientService();
   const capabilityRunner = new CapabilityRunner(approvalService, mcpClientService);
   const webSearchService = new WebSearchService(secrets);
-  const agentOrchestrator = new AgentOrchestrator(gitService);
+  const agentOrchestrator = new AgentOrchestrator(gitService, repoProfileStore, failureMemoryStore);
   const providers = new ProviderRegistry();
 
   providers.register(new DeepSeekProvider(async () => secrets.getDeepSeekApiKey()));
@@ -71,7 +75,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const patchService = new PatchService(context.globalStorageUri);
   const agentToolLoop = new AgentToolLoop(providers);
   const patchWorkflow = new PatchWorkflowService(providers, gitService, patchService);
-  const chatViewProvider = new ChatViewProvider(context.extensionUri, providers, gitService, patchWorkflow, chatSessionService, approvalService, capabilityRunner, webSearchService, mcpClientService, agentOrchestrator, agentToolLoop, verifyService);
+  const chatViewProvider = new ChatViewProvider(context.extensionUri, providers, gitService, patchWorkflow, chatSessionService, approvalService, capabilityRunner, webSearchService, mcpClientService, agentOrchestrator, agentToolLoop, verifyService, failureMemoryStore);
   const inlineExplainService = new InlineExplainService(providers);
 
   context.subscriptions.push(

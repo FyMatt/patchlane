@@ -9,12 +9,28 @@ import {
 import { buildAgentMemoryContext, extractPreviousPlanBlock, shouldFollowPlan } from "../services/agentMemory";
 import { compactText, normalizeToolPlan, parsePlannerJson } from "../services/agentToolPlan";
 import { parseCapabilityManifestJson } from "../services/capabilityManifest";
+import { buildFailureMemoryRecord, FailureMemoryStore, formatFailureMemoryForPrompt, selectRelevantFailureMemory } from "../services/failureMemory";
 import { parseGitStatus } from "../services/gitStatusParser";
 import { filterPatchHunks, getHunkChoices } from "../services/hunkSelector";
 import { parseHttpMcpPayload, readSseJsonRpcResponse } from "../services/mcpHttpParser";
+import { buildPlanRiskChecks, PatchQualityPlan } from "../services/patchQualityRules";
+import { inferPatchRiskLevel, normalizePatchRiskLevel } from "../services/patchRisk";
+import { buildRepoProfile, formatRepoProfileForPrompt } from "../services/repoProfile";
+import {
+  advanceStagedTask,
+  buildStagedPhaseRequest,
+  createDraftStageInfo,
+  createPhasePatchPlan,
+  createStagedTaskState,
+  markCurrentPhaseDone,
+  markCurrentPhaseDraftReady,
+  markCurrentPhaseFailed,
+  shouldUseStagedExecution
+} from "../services/stagedTaskPlan";
 import { applyPatchToText, extractUnifiedDiff, parseUnifiedDiff } from "../services/unifiedDiff";
 import { doesSearchProviderNeedApiKey, getFreeSearchBaseUrls, webSearchProviderLabel } from "../services/webSearchDefaults";
 import { formatWebSearchError } from "../services/webSearchErrors";
+import { classifyWebSearchTrust, formatWebSearchCitation } from "../services/webSearchTrust";
 import {
   parseBaiduHtmlResults,
   parseBingHtmlResults,
@@ -23,6 +39,7 @@ import {
   parseSogouHtmlResults
 } from "../services/webSearchParsing";
 import { rankAndFilterSearchResults } from "../services/webSearchRelevance";
+import { buildScopedVerifyPlan } from "../services/verifyPlanner";
 import { createEmptyResponseError, createMissingApiKeyError, createRequestError, formatProviderErrorForUser } from "../providers/errors";
 
 function firstPatch(diff: string) {
@@ -166,6 +183,8 @@ function testToolPlanFiltersInvalidAndDedupesActions(): void {
       { type: "run_capability", capabilityId: "missing" },
       { type: "run_capability", capabilityId: "review", input: "x" },
       { type: "run_capability", capabilityId: "review", input: "x" },
+      { type: "search_text", query: " handleSubmit " },
+      { type: "search_text", query: "handleSubmit" },
       { type: "web_search", query: " VS Code API " },
       { type: "web_search", query: "vs code api" }
     ]
@@ -174,9 +193,10 @@ function testToolPlanFiltersInvalidAndDedupesActions(): void {
     skills: [{ id: "review", label: "代码审查", description: "检查代码" }],
     tools: []
   });
-  assert.strictEqual(plan.actions.length, 2);
+  assert.strictEqual(plan.actions.length, 3);
   assert.deepStrictEqual(plan.actions[0], { type: "run_capability", capabilityId: "review", input: "x", reason: undefined });
-  assert.deepStrictEqual(plan.actions[1], { type: "web_search", query: "VS Code API", reason: undefined });
+  assert.deepStrictEqual(plan.actions[1], { type: "search_text", query: "handleSubmit", reason: undefined });
+  assert.deepStrictEqual(plan.actions[2], { type: "web_search", query: "VS Code API", reason: undefined });
 }
 
 function testCompactTextKeepsHeadAndTail(): void {
@@ -185,6 +205,283 @@ function testCompactTextKeepsHeadAndTail(): void {
   assert.ok(compacted.includes("[已截断"));
   assert.ok(compacted.startsWith("aaaaaaaa"));
   assert.ok(compacted.endsWith("zzzzzz"));
+}
+
+function testScopedVerifyPlanPrefersRelevantCommands(): void {
+  const commands = ["npm run typecheck", "npm test", "npm run lint", "npm run build"];
+
+  const sourcePlan = buildScopedVerifyPlan(commands, ["src/app.ts"]);
+  assert.deepStrictEqual(sourcePlan.commands, ["npm run typecheck", "npm test", "npm run lint"]);
+  assert.strictEqual(sourcePlan.scoped, true);
+
+  const docsPlan = buildScopedVerifyPlan(commands, ["docs/usage.md"]);
+  assert.deepStrictEqual(docsPlan.commands, ["npm run lint"]);
+  assert.strictEqual(docsPlan.scoped, true);
+}
+
+function testPatchRiskLevelInference(): void {
+  assert.strictEqual(normalizePatchRiskLevel("medium"), "medium");
+  assert.strictEqual(normalizePatchRiskLevel("unknown"), undefined);
+  assert.strictEqual(inferPatchRiskLevel([{ path: "src/app.ts", operation: "modify" }]), "low");
+  assert.strictEqual(inferPatchRiskLevel([
+    { path: "src/app.ts", operation: "modify" },
+    { path: "src/routes.ts", operation: "modify" }
+  ]), "medium");
+  assert.strictEqual(inferPatchRiskLevel([{ path: "src/auth/session.ts", operation: "modify" }]), "high");
+  assert.strictEqual(inferPatchRiskLevel([{ path: "src/app.ts", operation: "delete" }]), "high");
+  assert.strictEqual(inferPatchRiskLevel([{ path: "src/app.ts", operation: "modify" }], ["涉及数据库迁移"]), "high");
+}
+
+function testRepoProfileSummarizesCodeMap(): void {
+  const profile = buildRepoProfile({
+    packageScripts: ["test: vitest run", "typecheck: tsc -p ./"],
+    files: [
+      {
+        path: "src/extension.ts",
+        languageId: "typescript",
+        lineCount: 120,
+        symbols: ["activate"],
+        imports: ["vscode"],
+        exports: ["activate"],
+        roles: ["source"]
+      },
+      {
+        path: "src/app.test.ts",
+        languageId: "typescript",
+        lineCount: 40,
+        symbols: [],
+        imports: ["vitest"],
+        exports: [],
+        roles: ["test"]
+      },
+      {
+        path: "package.json",
+        languageId: "json",
+        lineCount: 20,
+        symbols: [],
+        imports: [],
+        exports: [],
+        roles: ["manifest"]
+      }
+    ]
+  }, new Date("2026-05-23T00:00:00.000Z"));
+
+  assert.deepStrictEqual(profile.languages, ["typescript", "json"]);
+  assert.deepStrictEqual(profile.entrypoints, ["src/extension.ts"]);
+  assert.deepStrictEqual(profile.testFiles, ["src/app.test.ts"]);
+  assert.ok(profile.testFrameworks.includes("vitest"));
+  assert.ok(formatRepoProfileForPrompt(profile, 1000).includes("Repo profile:"));
+}
+
+async function testFailureMemoryStoresDedupesAndFormats(): Promise<void> {
+  const backing = new Map<string, unknown>();
+  const store = new FailureMemoryStore({
+    get<T>(key: string, defaultValue?: T): T | undefined {
+      return backing.has(key) ? backing.get(key) as T : defaultValue;
+    },
+    update(key: string, value: unknown): void {
+      backing.set(key, value);
+    }
+  });
+
+  const input = {
+    result: {
+      command: "npm run typecheck",
+      exitCode: 2,
+      output: "src/app.ts:10:5 - error TS2322: Type string is not assignable to number.",
+      keyLines: ["src/app.ts:10:5 - error TS2322: Type string is not assignable to number."],
+      failureKind: "typescript",
+      summary: "TS2322 type mismatch"
+    },
+    source: "manualVerify" as const,
+    files: ["src/app.ts"],
+    prompt: "淇 src/app.ts 绫诲瀷闂",
+    now: new Date("2026-05-23T00:00:00.000Z")
+  };
+
+  await store.record(input);
+  await store.record({ ...input, now: new Date("2026-05-23T00:01:00.000Z") });
+  const records = store.getAll();
+  assert.strictEqual(records.length, 1);
+  assert.strictEqual(records[0].count, 2);
+  assert.strictEqual(records[0].files[0], "src/app.ts");
+
+  const relevant = store.getRelevant({ prompt: "app.ts TS2322", files: ["src/app.ts"] });
+  assert.strictEqual(relevant.length, 1);
+  assert.ok(formatFailureMemoryForPrompt(relevant, 1000).includes("Recent verification failure memory"));
+}
+
+function testFailureMemorySkipsPassingResults(): void {
+  const record = buildFailureMemoryRecord({
+    result: {
+      command: "npm test",
+      exitCode: 0,
+      output: "pass",
+      failureKind: "pass"
+    },
+    source: "agentVerify"
+  });
+  assert.strictEqual(record, undefined);
+}
+
+function testFailureMemorySelectsByFileAndKind(): void {
+  const first = buildFailureMemoryRecord({
+    result: {
+      command: "npm test",
+      exitCode: 1,
+      output: "Expected true received false",
+      keyLines: ["Expected true received false"],
+      failureKind: "test",
+      summary: "assertion failed"
+    },
+    source: "postApply",
+    files: ["src/app.test.ts"],
+    now: new Date("2026-05-23T00:00:00.000Z")
+  });
+  const second = buildFailureMemoryRecord({
+    result: {
+      command: "npm run lint",
+      exitCode: 1,
+      output: "eslint no-unused-vars",
+      keyLines: ["eslint no-unused-vars"],
+      failureKind: "lint",
+      summary: "lint failed"
+    },
+    source: "manualVerify",
+    files: ["src/style.ts"],
+    now: new Date("2026-05-23T00:01:00.000Z")
+  });
+  assert.ok(first);
+  assert.ok(second);
+  const selected = selectRelevantFailureMemory([second, first], {
+    prompt: "淇 app.test.ts 娴嬭瘯",
+    files: ["src/app.test.ts"],
+    failureKind: "test"
+  });
+  assert.strictEqual(selected[0].failureKind, "test");
+}
+
+function testWebSearchTrustClassificationAndCitation(): void {
+  const official = {
+    title: "React useActionState",
+    url: "https://react.dev/reference/react/useActionState",
+    snippet: "Official docs",
+    rank: 2,
+    updatedAt: "2026-05-01"
+  };
+  assert.strictEqual(classifyWebSearchTrust(official, "docs"), "official");
+  assert.ok(formatWebSearchCitation(official, "official").includes("#2 official"));
+
+  assert.strictEqual(classifyWebSearchTrust({
+    title: "Bug discussion",
+    url: "https://github.com/example/repo/issues/1",
+    snippet: "Issue",
+    rank: 1
+  }, "github"), "github");
+
+  assert.strictEqual(classifyWebSearchTrust({
+    title: "How to fix",
+    url: "https://stackoverflow.com/questions/1",
+    snippet: "Community answer",
+    rank: 3
+  }), "community");
+}
+
+function testHighRiskPlanRequiresVerificationAndCheckpoints(): void {
+  const basePlan: PatchQualityPlan = {
+    riskLevel: "high",
+    checkpoints: [],
+    verification: [],
+    contextGaps: []
+  };
+
+  const failedChecks = buildPlanRiskChecks(basePlan);
+  assert.strictEqual(failedChecks.find((check) => check.id === "risk-verification")?.status, "fail");
+  assert.strictEqual(failedChecks.find((check) => check.id === "risk-checkpoints")?.status, "fail");
+
+  const passingChecks = buildPlanRiskChecks({
+    ...basePlan,
+    verification: ["npm test"],
+    checkpoints: [{
+      verification: ["npm test"]
+    }]
+  });
+  assert.strictEqual(passingChecks.find((check) => check.id === "risk-verification")?.status, "pass");
+  assert.strictEqual(passingChecks.find((check) => check.id === "risk-checkpoints")?.status, "pass");
+
+  const vagueChecks = buildPlanRiskChecks({
+    ...basePlan,
+    verification: ["检查结果"],
+    checkpoints: [{ verification: ["检查结果"] }]
+  });
+  assert.strictEqual(vagueChecks.find((check) => check.id === "risk-verification")?.status, "fail");
+}
+
+function testStagedTaskPlanLifecycle(): void {
+  const plan = {
+    summary: "分阶段实现复杂能力",
+    riskLevel: "medium" as const,
+    files: [
+      { path: "src/a.ts", reason: "阶段一" },
+      { path: "src/b.ts", reason: "阶段二" },
+      { path: "src/c.ts", reason: "阶段三" }
+    ],
+    checkpoints: [
+      { id: "cp1", title: "建立状态机", files: ["src/a.ts"], acceptanceCriteria: ["状态可记录"], verification: ["npm test"] },
+      { id: "cp2", title: "接入 UI", files: ["src/b.ts"], acceptanceCriteria: ["UI 可见"], verification: ["npm test"] }
+    ],
+    steps: ["先状态机", "再 UI"],
+    acceptanceCriteria: ["复杂任务可拆分"],
+    verification: ["npm test"],
+    risks: [],
+    contextGaps: [],
+    assumptions: []
+  };
+
+  assert.strictEqual(shouldUseStagedExecution(plan, "实现复杂任务"), true);
+  let task = createStagedTaskState(plan, "实现复杂任务", new Date("2026-05-23T00:00:00.000Z"));
+  assert.strictEqual(task.phaseCount, 2);
+  assert.strictEqual(task.phases[0].status, "pending");
+  task = markCurrentPhaseDraftReady(task, "draft1", ["modify src/a.ts"], new Date("2026-05-23T00:01:00.000Z"));
+  assert.strictEqual(task.phases[0].status, "ready");
+  task = markCurrentPhaseDone(task, new Date("2026-05-23T00:02:00.000Z"));
+  task = advanceStagedTask(task, new Date("2026-05-23T00:03:00.000Z"));
+  assert.strictEqual(task.currentPhaseIndex, 1);
+  task = markCurrentPhaseFailed(task, "验证失败", new Date("2026-05-23T00:04:00.000Z"));
+  assert.strictEqual(task.status, "failed");
+  assert.strictEqual(task.phases[1].failureReason, "验证失败");
+}
+
+function testStagedPhasePlanAndPromptStayScoped(): void {
+  const plan = {
+    summary: "实现多模块重构",
+    riskLevel: "high" as const,
+    files: [
+      { path: "src/a.ts", reason: "阶段一" },
+      { path: "src/b.ts", reason: "阶段二" }
+    ],
+    checkpoints: [
+      { id: "cp1", title: "阶段一", files: ["src/a.ts"], acceptanceCriteria: ["A 完成"], verification: ["npm test"] },
+      { id: "cp2", title: "阶段二", files: ["src/b.ts"], acceptanceCriteria: ["B 完成"], verification: ["npm test"] }
+    ],
+    steps: ["先 A", "再 B"],
+    acceptanceCriteria: ["全部完成"],
+    verification: ["npm test"],
+    risks: [],
+    contextGaps: [],
+    assumptions: []
+  };
+  const task = createStagedTaskState(plan, "重构", new Date("2026-05-23T00:00:00.000Z"));
+  const phase = task.phases[0];
+  const phasePlan = createPhasePatchPlan(plan, phase, 0, task.phaseCount);
+  const stageInfo = createDraftStageInfo(task, phase);
+  const prompt = buildStagedPhaseRequest("重构", task, phase);
+
+  assert.strictEqual(phasePlan.files.length, 1);
+  assert.strictEqual(phasePlan.files[0].path, "src/a.ts");
+  assert.strictEqual(stageInfo.phaseIndex, 1);
+  assert.ok(prompt.includes("只执行阶段 1/2"));
+  assert.ok(prompt.includes("后续阶段"));
 }
 
 function testAgentMemoryDetectsFollowPlanPrompt(): void {
@@ -639,6 +936,16 @@ async function run(): Promise<void> {
   testToolPlanParsesFencedJson();
   testToolPlanFiltersInvalidAndDedupesActions();
   testCompactTextKeepsHeadAndTail();
+  testScopedVerifyPlanPrefersRelevantCommands();
+  testPatchRiskLevelInference();
+  testRepoProfileSummarizesCodeMap();
+  await testFailureMemoryStoresDedupesAndFormats();
+  testFailureMemorySkipsPassingResults();
+  testFailureMemorySelectsByFileAndKind();
+  testWebSearchTrustClassificationAndCitation();
+  testHighRiskPlanRequiresVerificationAndCheckpoints();
+  testStagedTaskPlanLifecycle();
+  testStagedPhasePlanAndPromptStayScoped();
   testAgentMemoryDetectsFollowPlanPrompt();
   testAgentMemoryExtractsPreviousPlan();
   testAgentMemoryCompactsPlanBlock();

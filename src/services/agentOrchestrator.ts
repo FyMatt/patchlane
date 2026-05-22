@@ -11,6 +11,9 @@ import {
   WorkspaceFileReference,
   WorkspaceFileSummary
 } from "./workspaceFiles";
+import { FailureMemoryStore, formatFailureMemoryForPrompt } from "./failureMemory";
+import { formatRepoProfileForPrompt, RepoProfileStore } from "./repoProfile";
+import { buildWorkspaceCodeMap, formatCodeMapForPrompt } from "./workspaceCodeMap";
 
 export type AgentOrchestratorStepKind = "think" | "tool" | "file" | "approval" | "model" | "patch" | "verify";
 export type AgentOrchestratorStepStatus = "pending" | "running" | "done" | "error";
@@ -41,7 +44,11 @@ interface ScoredFile {
 }
 
 export class AgentOrchestrator {
-  public constructor(private readonly gitService: GitService) {}
+  public constructor(
+    private readonly gitService: GitService,
+    private readonly repoProfileStore?: RepoProfileStore,
+    private readonly failureMemoryStore?: FailureMemoryStore
+  ) {}
 
   public async prepare(request: AgentOrchestratorRequest): Promise<AgentOrchestratorResult> {
     const progress = request.onProgress;
@@ -58,11 +65,12 @@ export class AgentOrchestrator {
 
     assertNotAborted(request.signal);
     progress?.("扫描相关文件", "running", "优先当前文件、已打开标签页和文件名匹配项", "file");
-    const [workspaceContext, preferredFiles, allFiles, explicitReferences] = await Promise.all([
+    const [workspaceContext, preferredFiles, allFiles, explicitReferences, codeMap] = await Promise.all([
       collectWorkspaceContext(this.gitService).catch(() => undefined),
       getPreferredReferenceFiles(30),
       listWorkspaceFiles(220),
-      collectPromptFileReferences(request.prompt, 8)
+      collectPromptFileReferences(request.prompt, 8),
+      buildWorkspaceCodeMap(Math.max(40, budget.candidateFiles * 6)).catch(() => undefined)
     ]);
     const candidates = rankCandidateFiles({
       activeFilePath: workspaceContext?.activeFilePath,
@@ -84,6 +92,13 @@ export class AgentOrchestrator {
     const diagnostics = collectRelevantDiagnostics(candidates.map((file) => file.path));
     progress?.("检查诊断信息", "done", diagnostics.length > 0 ? `${diagnostics.length} 条相关诊断` : "当前候选文件暂无诊断", "verify");
 
+    const repoProfile = codeMap
+      ? await this.repoProfileStore?.updateFromCodeMap(codeMap).catch(() => undefined)
+      : this.repoProfileStore?.get();
+    const failureMemorySummary = formatFailureMemoryForPrompt(this.failureMemoryStore?.getRelevant({
+      prompt: request.prompt,
+      files: candidates.map((file) => file.path)
+    }, 4) ?? [], Math.min(2200, Math.floor(budget.contextChars * 0.1)));
     const contextBlock = compactText(formatAgentContext({
       prompt: request.prompt,
       keywords,
@@ -96,7 +111,10 @@ export class AgentOrchestrator {
       diffContext: workspaceContext?.diffContext,
       candidates,
       referencedFiles,
-      diagnostics
+      diagnostics,
+      repoProfileSummary: repoProfile ? formatRepoProfileForPrompt(repoProfile, Math.min(2500, Math.floor(budget.contextChars * 0.12))) : undefined,
+      failureMemorySummary,
+      codeMapSummary: codeMap ? formatCodeMapForPrompt(codeMap, Math.min(5000, Math.floor(budget.contextChars * 0.22))) : undefined
     }), budget.contextChars);
 
     return {
@@ -214,6 +232,9 @@ function formatAgentContext(input: {
   candidates: WorkspaceFileSummary[];
   referencedFiles: WorkspaceFileReference[];
   diagnostics: string[];
+  repoProfileSummary?: string;
+  failureMemorySummary?: string;
+  codeMapSummary?: string;
 }): string {
   const selectedSkills = input.capabilityContext.skills.map((item) => `${item.label}(${item.id})`).join("、") || "未选择";
   const selectedTools = input.capabilityContext.tools.map((item) => `${item.label}(${item.id})`).join("、") || "未选择";
@@ -248,6 +269,15 @@ function formatAgentContext(input: {
     "",
     "候选文件：",
     ...candidateLines,
+    "",
+    "Workspace code map summary:",
+    input.codeMapSummary ?? "none",
+    "",
+    "Repo profile memory:",
+    input.repoProfileSummary ?? "none",
+    "",
+    "Verification failure memory:",
+    input.failureMemorySummary || "none",
     "",
     "已读取的关键文件：",
     ...fileBlocks,
